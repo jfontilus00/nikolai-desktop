@@ -1,0 +1,148 @@
+================================================================================
+                    QUICK BUILD & TEST GUIDE
+                    Nikolai Desktop - Ollama Proxy
+================================================================================
+
+PROJECT ROOT: C:\Dev\Nikolai-desktop
+
+================================================================================
+STEP 1: BUILD (Run in PowerShell)
+================================================================================
+
+cd C:\Dev\Nikolai-desktop
+pnpm dlx @tauri-apps/cli@1.5.9 build
+
+Expected output:
+  ✓ no errors
+  ✓ "Finished release [optimized] target(s)"
+  ✓ MSI created in src-tauri\target\release\
+
+If errors occur:
+  - Check Rust version: rustc --version (need >= 1.60)
+  - Update deps: cargo update
+  - Check Cargo.toml for missing dependencies
+
+================================================================================
+STEP 2: TEST OLLAMA MODELS
+================================================================================
+
+1. Install and run the MSI
+2. Open app
+3. Set Ollama URL (e.g., http://localhost:11434)
+4. Click "Refresh models"
+5. Verify models appear in dropdown
+
+Expected: Model list from Ollama
+
+================================================================================
+STEP 3: TEST NON-STREAMING CHAT
+================================================================================
+
+1. Select a model
+2. Send a message
+3. Wait for complete response
+
+Expected: Full response appears at once
+
+================================================================================
+STEP 4: TEST STREAMING CHAT
+================================================================================
+
+1. Select a model
+2. Send a message
+3. Watch tokens appear progressively
+4. Try clicking "Stop" during streaming
+
+Expected: 
+  - Tokens appear one by one
+  - Stop button cancels stream
+  - No crashes or hangs
+
+================================================================================
+STEP 5: TEST CANCELLATION
+================================================================================
+
+1. Start a streaming chat
+2. Click "Stop" before completion
+3. Start another chat immediately
+
+Expected:
+  - First chat stops cleanly
+  - Second chat works normally
+  - No resource leaks
+
+================================================================================
+STEP 6: TEST BROWSER DEV MODE
+================================================================================
+
+cd C:\Dev\Nikolai-desktop
+pnpm dev
+
+Expected:
+  - Ollama still works via direct fetch
+  - No regressions
+  - Same functionality as MSI
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+Problem: "file not found for module `ollama_proxy`"
+Solution: Verify src-tauri/src/ollama_proxy.rs exists (5671 bytes)
+
+Problem: "cannot find crate reqwest"
+Solution: Check Cargo.toml has reqwest dependency
+
+Problem: "invoke is not a function"
+Solution: Verify @tauri-apps/api is installed (pnpm install)
+
+Problem: Streaming doesn't work
+Solution: 
+  - Check event listeners in ollamaStream.ts
+  - Verify Rust emits events correctly
+  - Check browser console for errors
+
+Problem: Models not loading
+Solution:
+  - Verify Ollama is running
+  - Check URL format (http://localhost:11434)
+  - Check network tab for errors
+
+================================================================================
+FILES TO CHECK IF ISSUES OCCUR
+================================================================================
+
+Rust Backend:
+  src-tauri/src/ollama_proxy.rs
+  src-tauri/src/main.rs
+  src-tauri/Cargo.toml
+
+TypeScript Frontend:
+  src/lib/ollamaModels.ts
+  src/lib/ollamaChat.ts
+  src/lib/ollamaStream.ts
+
+================================================================================
+SUCCESS CRITERIA
+================================================================================
+
+✓ Build completes without errors
+✓ MSI installs successfully
+✓ Models load from Ollama
+✓ Non-streaming chat works
+✓ Streaming chat works with progressive tokens
+✓ Cancellation works cleanly
+✓ No crashes or hangs
+✓ Browser dev mode still works
+
+================================================================================
+CONTACT/HELP
+================================================================================
+
+If issues persist:
+  1. Check OLLAMA_PROXY_SUMMARY.txt for details
+  2. Review OLLAMA_PROXY_IMPLEMENTATION_COMPLETE.txt
+  3. Verify all 6 files were updated correctly
+  4. Check Rust and Node versions
+
+================================================================================

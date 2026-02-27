@@ -1,0 +1,346 @@
+﻿use once_cell::sync::OnceCell;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{
+  collections::HashMap,
+  process::Stdio,
+  sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+  },
+  time::Duration,
+};
+use tokio::{
+  io::{AsyncReadExt, AsyncWriteExt},
+  process::{Child, ChildStdin, ChildStdout, Command},
+  sync::{oneshot, Mutex},
+  time::timeout,
+};
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpConnectConfig {
+  pub command: String,
+  pub args: Vec<String>,
+  pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McpStatus {
+  pub connected: bool,
+  pub command: Option<String>,
+  pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct McpTool {
+  pub name: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub description: Option<String>,
+  #[serde(rename = "inputSchema", skip_serializing_if = "Option::is_none")]
+  pub input_schema: Option<Value>,
+}
+
+type PendingMap = HashMap<u64, oneshot::Sender<Result<Value, Value>>>;
+
+struct McpClient {
+  child: Mutex<Child>,
+  stdin: Mutex<ChildStdin>,
+  pending: Mutex<PendingMap>,
+  next_id: AtomicU64,
+  command: String,
+  cwd: Option<String>,
+}
+
+static MCP: OnceCell<Mutex<Option<Arc<McpClient>>>> = OnceCell::new();
+
+fn ensure_state() -> &'static Mutex<Option<Arc<McpClient>>> {
+  MCP.get_or_init(|| Mutex::new(None))
+}
+
+async fn handle_message(raw: &str, client: &Arc<McpClient>) {
+  let v: Value = match serde_json::from_str(raw) {
+    Ok(v) => v,
+    Err(_) => return,
+  };
+
+  let id = match v.get("id").and_then(|x| x.as_u64()) {
+    Some(id) => id,
+    None => return,
+  };
+
+  let result = if v.get("error").is_some() {
+    Err(v.get("error").cloned().unwrap_or(Value::Null))
+  } else {
+    Ok(v.get("result").cloned().unwrap_or(Value::Null))
+  };
+
+  let mut pending = client.pending.lock().await;
+  if let Some(tx) = pending.remove(&id) {
+    let _ = tx.send(result);
+  }
+}
+
+async fn reader_loop(mut out: ChildStdout, client: Arc<McpClient>) {
+  let mut buf: Vec<u8> = Vec::with_capacity(8192);
+  let mut tmp = [0u8; 4096];
+
+  loop {
+    let n = match out.read(&mut tmp).await {
+      Ok(0) => break,
+      Ok(n) => n,
+      Err(_) => break,
+    };
+
+    buf.extend_from_slice(&tmp[..n]);
+
+    loop {
+      let s = match std::str::from_utf8(&buf) {
+        Ok(s) => s,
+        Err(_) => break,
+      };
+
+      // Support LSP-style Content-Length framing (some MCP servers do this)
+      if s.starts_with("Content-Length:") {
+        if let Some(hdr_end) = s.find("\r\n\r\n") {
+          let headers = &s[..hdr_end];
+          let mut len: usize = 0;
+
+          for line in headers.lines() {
+            if let Some(v) = line.strip_prefix("Content-Length:") {
+              len = v.trim().parse::<usize>().unwrap_or(0);
+            }
+          }
+
+          let total_needed = hdr_end + 4 + len;
+          if buf.len() < total_needed {
+            break;
+          }
+
+          let json_bytes = buf[(hdr_end + 4)..(hdr_end + 4 + len)].to_vec();
+          let json_str = String::from_utf8_lossy(&json_bytes).to_string();
+          buf.drain(0..total_needed);
+
+          handle_message(&json_str, &client).await;
+          continue;
+        }
+        break;
+      }
+
+      // Newline-delimited JSON (common MCP stdio)
+      if let Some(pos) = s.find('\n') {
+        let line = s[..pos].trim().to_string();
+        buf.drain(0..pos + 1);
+
+        if !line.is_empty() {
+          handle_message(&line, &client).await;
+        }
+        continue;
+      }
+
+      break;
+    }
+  }
+}
+
+async fn notify_with_client(client: Arc<McpClient>, method: &str, params: Value) -> Result<(), String> {
+  let msg = json!({
+    "jsonrpc": "2.0",
+    "method": method,
+    "params": params
+  });
+  let text = msg.to_string() + "\n";
+
+  let mut stdin = client.stdin.lock().await;
+  stdin
+    .write_all(text.as_bytes())
+    .await
+    .map_err(|e| format!("stdin write failed: {}", e))?;
+  stdin.flush().await.map_err(|e| format!("stdin flush failed: {}", e))?;
+  Ok(())
+}
+
+async fn request_with_client(client: Arc<McpClient>, method: &str, params: Value) -> Result<Value, String> {
+  let id = client.next_id.fetch_add(1, Ordering::SeqCst);
+
+  let req = json!({
+    "jsonrpc":"2.0",
+    "id": id,
+    "method": method,
+    "params": params
+  });
+
+  let (tx, rx) = oneshot::channel::<Result<Value, Value>>();
+  {
+    let mut pending = client.pending.lock().await;
+    pending.insert(id, tx);
+  }
+
+  {
+    let mut stdin = client.stdin.lock().await;
+    let line = req.to_string() + "\n";
+    stdin.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
+    stdin.flush().await.map_err(|e| e.to_string())?;
+  }
+
+  match timeout(Duration::from_secs(60), rx).await {
+    Ok(Ok(Ok(v))) => Ok(v),
+    Ok(Ok(Err(e))) => Err(format!("MCP error: {}", e)),
+    Ok(Err(_)) => Err("MCP response channel closed".to_string()),
+    Err(_) => Err("MCP timeout".to_string()),
+  }
+}
+
+async fn request(method: &str, params: Value) -> Result<Value, String> {
+  let state = ensure_state();
+  let client = {
+    let guard = state.lock().await;
+    guard.clone().ok_or("MCP not connected")?
+  };
+  request_with_client(client, method, params).await
+}
+
+#[tauri::command]
+pub async fn mcp_status() -> McpStatus {
+  let state = ensure_state();
+  let guard = state.lock().await;
+  if let Some(c) = guard.as_ref() {
+    McpStatus {
+      connected: true,
+      command: Some(c.command.clone()),
+      cwd: c.cwd.clone(),
+    }
+  } else {
+    McpStatus {
+      connected: false,
+      command: None,
+      cwd: None,
+    }
+  }
+}
+
+#[tauri::command]
+pub async fn mcp_connect(cfg: McpConnectConfig) -> Result<McpStatus, String> {
+  let state = ensure_state();
+  {
+    let guard = state.lock().await;
+    if guard.is_some() {
+      return Ok(mcp_status().await);
+    }
+  }
+
+  if cfg.command.trim().is_empty() {
+    return Err("Command is empty".to_string());
+  }
+
+  let mut cmd = Command::new(&cfg.command);
+  cmd.args(&cfg.args)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::inherit());
+
+  if let Some(cwd) = &cfg.cwd {
+    if !cwd.trim().is_empty() {
+      cmd.current_dir(cwd);
+    }
+  }
+
+  let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {}", e))?;
+  let stdin = child.stdin.take().ok_or("Failed to open stdin")?;
+  let stdout = child.stdout.take().ok_or("Failed to open stdout")?;
+
+  let client = Arc::new(McpClient {
+    child: Mutex::new(child),
+    stdin: Mutex::new(stdin),
+    pending: Mutex::new(HashMap::new()),
+    next_id: AtomicU64::new(1),
+    command: cfg.command.clone(),
+    cwd: cfg.cwd.clone(),
+  });
+
+  // Start reader loop (non-blocking)
+  let c_out = client.clone();
+  tauri::async_runtime::spawn(async move {
+    reader_loop(stdout, c_out).await;
+  });
+
+  // Store connected client immediately (UI will update fast)
+  {
+    let mut guard = state.lock().await;
+    *guard = Some(client.clone());
+  }
+
+  // Initialize in background (do NOT block connect)
+  tauri::async_runtime::spawn(async move {
+    let init = request_with_client(
+      client.clone(),
+      "initialize",
+      json!({
+        "protocolVersion": "2024-11-05",
+        "clientInfo": { "name":"Nikolai Desktop", "version":"0.1.0" },
+        "capabilities": { "tools": {} }
+      }),
+    )
+    .await;
+
+    if init.is_ok() {
+      let _ = notify_with_client(client.clone(), "notifications/initialized", json!({})).await;
+      println!("[mcp] initialize success");
+    } else {
+      println!("[mcp] initialize warning: {:?}", init.err());
+    }
+  });
+
+  Ok(mcp_status().await)
+}
+
+#[tauri::command]
+pub async fn mcp_disconnect() -> Result<McpStatus, String> {
+  let state = ensure_state();
+  let client = {
+    let mut guard = state.lock().await;
+    guard.take()
+  };
+
+  if let Some(c) = client {
+    let mut child = c.child.lock().await;
+    let _ = child.kill().await;
+  }
+
+  Ok(mcp_status().await)
+}
+
+#[tauri::command]
+pub async fn mcp_list_tools() -> Result<Vec<McpTool>, String> {
+  let v = request("tools/list", json!({})).await?;
+  let tools = v.get("tools").cloned().unwrap_or(Value::Array(vec![]));
+
+  let mut out: Vec<McpTool> = vec![];
+  if let Value::Array(arr) = tools {
+    for t in arr {
+      let name = t.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+      if name.is_empty() {
+        continue;
+      }
+      let description = t.get("description").and_then(|x| x.as_str()).map(|s| s.to_string());
+      let input_schema = t.get("inputSchema").cloned().or_else(|| t.get("input_schema").cloned());
+      out.push(McpTool { name, description, input_schema });
+    }
+  }
+
+  Ok(out)
+}
+
+#[tauri::command]
+pub async fn mcp_call_tool(name: String, args: Value) -> Result<Value, String> {
+  let v = request(
+    "tools/call",
+    json!({
+      "name": name,
+      "arguments": args
+    }),
+  )
+  .await?;
+
+  Ok(v)
+}
+

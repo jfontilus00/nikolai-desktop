@@ -1,0 +1,1734 @@
+
+================================================================================
+RAW FILES (line numbered)
+================================================================================
+
+################################################################################
+[FILE] C:\Dev\Nikolai-desktop\src\lib\mcp.ts
+    1: import { invoke } from "@tauri-apps/api/tauri";
+    2: import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+    3: import { useSyncExternalStore } from "react";
+    4: 
+    5: export type McpStdioConfig = {
+    6:   command: string;
+    7:   args: string[];
+    8:   cwd?: string | null;
+    9: };
+   10: 
+   11: export type McpStatus = {
+   12:   connected: boolean;
+   13:   command?: string;
+   14:   cwd?: string | null;
+   15: };
+   16: 
+   17: export type McpTool = {
+   18:   name: string;
+   19:   description?: string;
+   20:   inputSchema?: any;
+   21: };
+   22: 
+   23: export type McpInfo = {
+   24:   timeout_secs: number;
+   25:   protocol_version: string;
+   26: };
+   27: 
+   28: export type McpStatePayload =
+   29:   | { state: "disconnected"; message?: string; ts: number }
+   30:   | { state: "connecting"; message?: string; ts: number }
+   31:   | { state: "connected"; message?: string; ts: number }
+   32:   | { state: "error"; message: string; ts: number };
+   33: 
+   34: function isTauri() {
+   35:   return typeof window !== "undefined" && (window as any).__TAURI__ != null;
+   36: }
+   37: 
+   38: export async function mcpStatus(): Promise<McpStatus> {
+   39:   if (!isTauri()) return { connected: false };
+   40:   return await invoke("mcp_status");
+   41: }
+   42: 
+   43: export async function mcpConnect(cfg: McpStdioConfig): Promise<McpStatus> {
+   44:   if (!isTauri()) throw new Error("Not running in Tauri");
+   45:   return await invoke("mcp_connect", { cfg });
+   46: }
+   47: 
+   48: export async function mcpDisconnect(): Promise<McpStatus> {
+   49:   if (!isTauri()) return { connected: false };
+   50:   return await invoke("mcp_disconnect");
+   51: }
+   52: 
+   53: export async function mcpListTools(): Promise<McpTool[]> {
+   54:   if (!isTauri()) throw new Error("Not running in Tauri");
+   55:   return await invoke("mcp_list_tools");
+   56: }
+   57: 
+   58: export async function mcpCallTool(name: string, args: any): Promise<any> {
+   59:   if (!isTauri()) throw new Error("Not running in Tauri");
+   60:   return await invoke("mcp_call_tool", { name, args });
+   61: }
+   62: 
+   63: export async function mcpInfo(): Promise<McpInfo> {
+   64:   if (!isTauri()) throw new Error("Not running in Tauri");
+   65:   return await invoke("mcp_info");
+   66: }
+   67: 
+   68: export async function listenMcpState(
+   69:   callback: (state: McpStatePayload) => void
+   70: ): Promise<UnlistenFn> {
+   71:   if (!isTauri()) throw new Error("Not running in Tauri");
+   72:   return await listen("mcp://state", (event) => {
+   73:     callback(event.payload as McpStatePayload);
+   74:   });
+   75: }
+   76: 
+   77: // ============================================================
+   78: // STRICT SINGLETON STORE - Module-level shared state
+   79: // ============================================================
+   80: 
+   81: type StoreSnapshot = {
+   82:   mcpState: "disconnected" | "connecting" | "connected" | "error";
+   83:   loading: boolean;
+   84:   error: string | null;
+   85:   tools: string[];
+   86:   toolsRaw: McpTool[];
+   87: };
+   88: 
+   89: const initialSnapshot: StoreSnapshot = {
+   90:   mcpState: "disconnected",
+   91:   loading: false,
+   92:   error: null,
+   93:   tools: [],
+   94:   toolsRaw: [],
+   95: };
+   96: 
+   97: let store: StoreSnapshot = { ...initialSnapshot };
+   98: let listeners: Set<() => void> = new Set();
+   99: 
+  100: // Track initialization to prevent duplicate setup
+  101: let initPromise: Promise<void> | null = null;
+  102: 
+  103: function notify() {
+  104:   listeners.forEach((fn) => fn());
+  105: }
+  106: 
+  107: function setStore(partial: Partial<StoreSnapshot>) {
+  108:   store = { ...store, ...partial };
+  109:   notify();
+  110: }
+  111: 
+  112: // Load tools with retry logic - MCP server may need time after connect
+  113: async function loadToolsWithRetry(maxRetries: number = 10, delayMs: number = 300): Promise<string[]> {
+  114:   let lastError: string | null = null;
+  115:   
+  116:   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  117:     try {
+  118:       console.log(`[MCP] loadTools attempt ${attempt}/${maxRetries}`);
+  119:       const res = await mcpListTools();
+  120:       const toolsRaw = Array.isArray(res) ? res : [];
+  121:       const tools = toolsRaw.map((t: any) => t.name || String(t));
+  122:       
+  123:       if (tools.length > 0) {
+  124:         console.log(`[MCP] Loaded ${tools.length} tools on attempt ${attempt}`);
+  125:         setStore({ tools, toolsRaw, error: null });
+  126:         return tools;
+  127:       }
+  128:       
+  129:       // Empty array returned - server may still be initializing
+  130:       lastError = "Empty tools list returned";
+  131:       console.log(`[MCP] Empty tools on attempt ${attempt}, retrying...`);
+  132:     } catch (e: any) {
+  133:       lastError = e?.message || String(e);
+  134:       console.log(`[MCP] loadTools error on attempt ${attempt}: ${lastError}`);
+  135:     }
+  136:     
+  137:     if (attempt < maxRetries) {
+  138:       await new Promise(r => setTimeout(r, delayMs));
+  139:     }
+  140:   }
+  141:   
+  142:   // All retries failed
+  143:   const errMsg = lastError || "Failed to load tools after retries";
+  144:   console.error(`[MCP] loadTools failed: ${errMsg}`);
+  145:   setStore({ tools: [], toolsRaw: [], error: errMsg });
+  146:   return [];
+  147: }
+  148: 
+  149: async function initialize(): Promise<void> {
+  150:   if (initPromise) return initPromise;
+  151: 
+  152:   initPromise = (async () => {
+  153:     // Initial status check
+  154:     try {
+  155:       const st = await mcpStatus();
+  156:       if (st.connected) {
+  157:         setStore({ mcpState: "connected" });
+  158:         await loadToolsWithRetry();
+  159:       }
+  160:     } catch (e) {
+  161:       console.warn("[MCP] Initial status check failed:", e);
+  162:     }
+  163: 
+  164:     // Set up single event listener
+  165:     try {
+  166:       await listenMcpState((payload) => {
+  167:         // Runtime guard: validate payload shape
+  168:         if (!payload || typeof payload.state !== "string") {
+  169:           console.warn("[MCP] Invalid state payload:", payload);
+  170:           return;
+  171:         }
+  172: 
+  173:         const newState = payload.state;
+  174:         console.log(`[MCP] Event received: ${newState}`, payload);
+  175: 
+  176:         if (newState === "connected") {
+  177:           setStore({ mcpState: "connected", loading: false, error: null });
+  178:           // Auto-fetch tools on connect with retry
+  179:           loadToolsWithRetry();
+  180:         } else if (newState === "connecting") {
+  181:           setStore({ mcpState: "connecting", loading: true, error: null });
+  182:         } else if (newState === "disconnected") {
+  183:           setStore({ mcpState: "disconnected", loading: false, tools: [], toolsRaw: [] });
+  184:         } else if (newState === "error") {
+  185:           setStore({
+  186:             mcpState: "error",
+  187:             loading: false,
+  188:             error: payload.message || "Unknown error",
+  189:             tools: [],
+  190:             toolsRaw: [],
+  191:           });
+  192:         }
+  193:       });
+  194:     } catch (e) {
+  195:       console.warn("[MCP] Failed to set up listener:", e);
+  196:     }
+  197:   })();
+  198: 
+  199:   return initPromise;
+  200: }
+  201: 
+  202: // Exported refreshTools - can be called directly
+  203: export async function refreshTools(): Promise<string[]> {
+  204:   if (store.mcpState !== "connected") return store.tools;
+  205:   return loadToolsWithRetry();
+  206: }
+  207: 
+  208: // Connect wrapper
+  209: export async function connect(cfg: McpStdioConfig): Promise<void> {
+  210:   setStore({ loading: true, error: null });
+  211:   try {
+  212:     await mcpConnect(cfg);
+  213:   } catch (e: any) {
+  214:     const errMsg = e?.message || String(e);
+  215:     setStore({
+  216:       loading: false,
+  217:       error: errMsg,
+  218:       mcpState: "error",
+  219:     });
+  220:     throw e;
+  221:   }
+  222: }
+  223: 
+  224: // Disconnect wrapper
+  225: export async function disconnect(): Promise<void> {
+  226:   setStore({ loading: true });
+  227:   try {
+  228:     await mcpDisconnect();
+  229:   } catch (e: any) {
+  230:     setStore({ loading: false, error: e?.message || String(e) });
+  231:     throw e;
+  232:   }
+  233: }
+  234: 
+  235: // ============================================================
+  236: // useSyncExternalStore hooks
+  237: // ============================================================
+  238: 
+  239: function subscribe(listener: () => void) {
+  240:   listeners.add(listener);
+  241:   return () => listeners.delete(listener);
+  242: }
+  243: 
+  244: function getSnapshot(): StoreSnapshot {
+  245:   return store;
+  246: }
+  247: 
+  248: function getServerSnapshot(): StoreSnapshot {
+  249:   return initialSnapshot;
+  250: }
+  251: 
+  252: // Public hook - components use this
+  253: export function useMcp() {
+  254:   // Ensure initialization runs once (StrictMode-safe)
+  255:   initialize();
+  256: 
+  257:   const state = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+  258: 
+  259:   return {
+  260:     mcpState: state.mcpState,
+  261:     loading: state.loading,
+  262:     error: state.error,
+  263:     tools: state.tools,
+  264:     toolsRaw: state.toolsRaw,
+  265:     connected: state.mcpState === "connected",
+  266:     connect,
+  267:     disconnect,
+  268:     refreshTools,
+  269:   };
+  270: }
+
+################################################################################
+[FILE] C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx
+    1: import { useEffect, useMemo, useState } from "react";
+    2: import WorkspacePanel from "./WorkspacePanel";
+    3: import { uid } from "../lib/id";
+    4: import {
+    5:   loadMcpProfiles,
+    6:   saveMcpProfiles,
+    7:   loadActiveMcpProfileId,
+    8:   saveActiveMcpProfileId,
+    9:   type McpProfile,
+   10:   loadToolLog,
+   11: } from "../lib/storage";
+   12: import { useMcp } from "../lib/mcp";
+   13: 
+   14: type Props = {
+   15:   onInsertToComposer?: (text: string) => void;
+   16: };
+   17: 
+   18: /**
+   19:  * Split args like a shell:
+   20:  *  - supports quotes:  --config "my file.json"
+   21:  *  - supports escaping quotes: \" inside quotes
+   22:  */
+   23: function splitArgs(input: string): string[] {
+   24:   const s = String(input || "").trim();
+   25:   if (!s) return [];
+   26:   const out: string[] = [];
+   27:   let cur = "";
+   28:   let q: '"' | "'" | null = null;
+   29: 
+   30:   for (let i = 0; i < s.length; i++) {
+   31:     const ch = s[i];
+   32: 
+   33:     if (q) {
+   34:       if (ch === "\\" && i + 1 < s.length) {
+   35:         // keep escaped next char
+   36:         cur += s[i + 1];
+   37:         i++;
+   38:         continue;
+   39:       }
+   40:       if (ch === q) {
+   41:         q = null;
+   42:         continue;
+   43:       }
+   44:       cur += ch;
+   45:       continue;
+   46:     }
+   47: 
+   48:     if (ch === '"' || ch === "'") {
+   49:       q = ch as any;
+   50:       continue;
+   51:     }
+   52: 
+   53:     if (/\s/.test(ch)) {
+   54:       if (cur.length) {
+   55:         out.push(cur);
+   56:         cur = "";
+   57:       }
+   58:       continue;
+   59:     }
+   60: 
+   61:     cur += ch;
+   62:   }
+   63: 
+   64:   if (cur.length) out.push(cur);
+   65:   return out;
+   66: }
+   67: 
+   68: export default function ToolsPanel({ onInsertToComposer }: Props) {
+   69:   const [subtab, setSubtab] = useState<"mcp" | "workspace">("mcp");
+   70: 
+   71:   // MCP profiles
+   72:   const [profiles, setProfiles] = useState<McpProfile[]>(() => loadMcpProfiles());
+   73:   const [activeId, setActiveId] = useState<string | null>(() => loadActiveMcpProfileId());
+   74: 
+   75:   // Shared MCP state from hook (single source of truth)
+   76:   const { mcpState, tools, error, loading, connected, connect, disconnect, refreshTools } = useMcp();
+   77: 
+   78:   const activeProfile = useMemo(() => profiles.find((p) => p.id === activeId) || null, [profiles, activeId]);
+   79: 
+   80:   // ensure at least one profile
+   81:   useEffect(() => {
+   82:     if (profiles.length > 0 && activeId) return;
+   83:     const now = Date.now();
+   84:     const p: McpProfile = {
+   85:       id: uid("mcp"),
+   86:       name: "Default MCP",
+   87:       createdAt: now,
+   88:       updatedAt: now,
+   89:       command: "",
+   90:       args: "",
+   91:       cwd: "",
+   92:       autoConnect: false,
+   93:     };
+   94:     const next = [p, ...profiles];
+   95:     setProfiles(next);
+   96:     saveMcpProfiles(next);
+   97:     setActiveId(p.id);
+   98:     saveActiveMcpProfileId(p.id);
+   99:     // eslint-disable-next-line react-hooks/exhaustive-deps
+  100:   }, []);
+  101: 
+  102:   useEffect(() => {
+  103:     saveActiveMcpProfileId(activeId);
+  104:   }, [activeId]);
+  105: 
+  106:   // auto-reconnect
+  107:   useEffect(() => {
+  108:     const run = async () => {
+  109:       if (subtab !== "mcp") return;
+  110:       if (!activeProfile) return;
+  111:       if (!activeProfile.autoConnect) return;
+  112:       if (!activeProfile.command.trim()) return;
+  113:       await connect({
+  114:         command: activeProfile.command,
+  115:         args: splitArgs(activeProfile.args),
+  116:         cwd: activeProfile.cwd || null,
+  117:       });
+  118:     };
+  119:     run().catch(() => {});
+  120:     // eslint-disable-next-line react-hooks/exhaustive-deps
+  121:   }, [subtab, activeId]);
+  122: 
+  123:   function updateProfile(patch: Partial<McpProfile>) {
+  124:     if (!activeProfile) return;
+  125:     const next = profiles.map((p) => (p.id === activeProfile.id ? { ...p, ...patch, updatedAt: Date.now() } : p));
+  126:     setProfiles(next);
+  127:     saveMcpProfiles(next);
+  128:   }
+  129: 
+  130:   function createProfile() {
+  131:     const name = prompt("New MCP profile name", "New MCP");
+  132:     if (!name || !name.trim()) return;
+  133:     const now = Date.now();
+  134:     const p: McpProfile = {
+  135:       id: uid("mcp"),
+  136:       name: name.trim(),
+  137:       createdAt: now,
+  138:       updatedAt: now,
+  139:       command: activeProfile?.command || "",
+  140:       args: activeProfile?.args || "",
+  141:       cwd: activeProfile?.cwd || "",
+  142:       autoConnect: false,
+  143:     };
+  144:     const next = [p, ...profiles];
+  145:     setProfiles(next);
+  146:     saveMcpProfiles(next);
+  147:     setActiveId(p.id);
+  148:     saveActiveMcpProfileId(p.id);
+  149:   }
+  150: 
+  151:   function renameProfile() {
+  152:     if (!activeProfile) return;
+  153:     const name = prompt("Rename MCP profile", activeProfile.name);
+  154:     if (!name || !name.trim()) return;
+  155:     updateProfile({ name: name.trim() });
+  156:   }
+  157: 
+  158:   function deleteProfile() {
+  159:     if (!activeProfile) return;
+  160:     if (!confirm(`Delete MCP profile "${activeProfile.name}"?`)) return;
+  161: 
+  162:     const next = profiles.filter((p) => p.id !== activeProfile.id);
+  163:     setProfiles(next);
+  164:     saveMcpProfiles(next);
+  165: 
+  166:     const nextActive = next[0]?.id ?? null;
+  167:     setActiveId(nextActive);
+  168:     saveActiveMcpProfileId(nextActive);
+  169:   }
+  170: 
+  171:   const toolLog = useMemo(() => loadToolLog().slice(-30).reverse(), [mcpState, error, connected, tools.length]);
+  172: 
+  173:   const handleConnect = () => {
+  174:     if (!activeProfile) return;
+  175:     connect({
+  176:       command: activeProfile.command,
+  177:       args: splitArgs(activeProfile.args),
+  178:       cwd: activeProfile.cwd || null,
+  179:     });
+  180:   };
+  181: 
+  182:   return (
+  183:     <div className="space-y-3">
+  184:       <div className="flex gap-2">
+  185:         <button className={`px-3 py-2 rounded ${subtab === "mcp" ? "bg-white/10" : "bg-transparent"} hover:bg-white/10`} onClick={() => setSubtab("mcp")}>
+  186:           MCP
+  187:         </button>
+  188:         <button className={`px-3 py-2 rounded ${subtab === "workspace" ? "bg-white/10" : "bg-transparent"} hover:bg-white/10`} onClick={() => setSubtab("workspace")}>
+  189:           Workspace
+  190:         </button>
+  191:       </div>
+  192: 
+  193:       {subtab === "workspace" ? <WorkspacePanel /> : null}
+  194: 
+  195:       {subtab === "mcp" ? (
+  196:         <div className="space-y-3">
+  197:           <div className="flex items-center justify-between">
+  198:             <div className="text-xs font-semibold opacity-80">MCP Tools</div>
+  199:             <div className="text-xs opacity-70">{mcpState}</div>
+  200:           </div>
+  201: 
+  202:           <div className="border border-white/10 rounded-lg p-3 bg-white/5 space-y-3">
+  203:             <label className="block text-xs opacity-70">Profile</label>
+  204:             <select
+  205:               className="w-full rounded-md bg-black/30 border border-white/10 px-3 py-2 text-sm outline-none focus:border-white/30"
+  206:               value={activeId || ""}
+  207:               onChange={(e) => setActiveId(e.target.value)}
+  208:             >
+  209:               {profiles.map((p) => (
+  210:                 <option key={p.id} value={p.id}>{p.name}</option>
+  211:               ))}
+  212:             </select>
+  213: 
+  214:             {/* DEBUG: Show MCP state info */}
+  215:             <div className="text-[10px] bg-black/40 p-2 rounded font-mono">
+  216:               DEBUG: state={mcpState} | tools={tools.length} | error={error || "none"}
+  217:             </div>
+  218: 
+  219:             <div className="flex gap-2">
+  220:               <button className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm" onClick={createProfile}>New</button>
+  221:               <button className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm" onClick={renameProfile} disabled={!activeProfile}>Rename</button>
+  222:               <button className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm" onClick={deleteProfile} disabled={!activeProfile}>Delete</button>
+  223:             </div>
+  224:           </div>
+  225: 
+  226:           <div className="border border-white/10 rounded-lg p-3 bg-white/5 space-y-3">
+  227:             <label className="block text-xs opacity-70">Command</label>
+  228:             <input
+  229:               className="w-full rounded-md bg-black/30 border border-white/10 px-3 py-2 text-sm outline-none focus:border-white/30"
+  230:               value={activeProfile?.command || ""}
+  231:               onChange={(e) => updateProfile({ command: e.target.value })}
+  232:               placeholder='e.g. C:\Program Files\nodejs\node.exe'
+  233:             />
+  234: 
+  235:             <label className="block text-xs opacity-70">Args (space-separated)</label>
+  236:             <input
+  237:               className="w-full rounded-md bg-black/30 border border-white/10 px-3 py-2 text-sm outline-none focus:border-white/30"
+  238:               value={activeProfile?.args || ""}
+  239:               onChange={(e) => updateProfile({ args: e.target.value })}
+  240:               placeholder='e.g. server.js --config mcp-hub.config.json'
+  241:             />
+  242: 
+  243:             <label className="block text-xs opacity-70">CWD (optional)</label>
+  244:             <input
+  245:               className="w-full rounded-md bg-black/30 border border-white/10 px-3 py-2 text-sm outline-none focus:border-white/30"
+  246:               value={activeProfile?.cwd || ""}
+  247:               onChange={(e) => updateProfile({ cwd: e.target.value })}
+  248:               placeholder='e.g. C:\Users\jackson\DEV\qwen-lab\mcp-hub'
+  249:             />
+  250: 
+  251:             <label className="flex items-center gap-2 text-xs opacity-80">
+  252:               <input type="checkbox" checked={Boolean(activeProfile?.autoConnect)} onChange={(e) => updateProfile({ autoConnect: e.target.checked })} />
+  253:               Auto reconnect on start
+  254:             </label>
+  255: 
+  256:             <div className="flex gap-2">
+  257:               <button className="px-3 py-2 rounded-md bg-blue-600 hover:bg-blue-500 text-sm font-semibold" onClick={handleConnect} disabled={!activeProfile?.command || loading}>
+  258:                 {loading ? "Connecting…" : "Connect"}
+  259:               </button>
+  260:               <button className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm" onClick={disconnect} disabled={loading}>
+  261:                 Disconnect
+  262:               </button>
+  263:               <button className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm" onClick={refreshTools} disabled={!connected}>
+  264:                 List tools
+  265:               </button>
+  266:             </div>
+  267: 
+  268:             {loading ? <div className="text-xs text-amber-300">Working...</div> : null}
+  269:             {error ? <div className="text-xs text-red-300">Error: {error}</div> : null}
+  270:           </div>
+  271: 
+  272:           <div className="border border-white/10 rounded-lg p-3 bg-white/5">
+  273:             <div className="text-xs font-semibold opacity-80 mb-2">Tools</div>
+  274:             {tools.length === 0 ? (
+  275:               <div className="text-xs opacity-60">No tools loaded yet.</div>
+  276:             ) : (
+  277:               <div className="space-y-1">
+  278:                 {tools.slice(0, 40).map((t) => (
+  279:                   <button
+  280:                     key={t}
+  281:                     className="w-full text-left px-2 py-1 rounded hover:bg-white/10 text-sm"
+  282:                     onClick={() => onInsertToComposer?.(`/tool ${t} {}`)}
+  283:                   >
+  284:                     {t}
+  285:                   </button>
+  286:                 ))}
+  287:                 {tools.length > 40 ? <div className="text-xs opacity-50">…and {tools.length - 40} more</div> : null}
+  288:               </div>
+  289:             )}
+  290:           </div>
+  291: 
+  292:           <div className="border border-white/10 rounded-lg p-3 bg-white/5">
+  293:             <div className="text-xs font-semibold opacity-80 mb-2">Recent tool log</div>
+  294:             {toolLog.length === 0 ? (
+  295:               <div className="text-xs opacity-60">No tool calls yet.</div>
+  296:             ) : (
+  297:               <div className="space-y-2">
+  298:                 {toolLog.map((x) => (
+  299:                   <div key={x.id} className="text-xs">
+  300:                     <div className="opacity-80">{x.title}</div>
+  301:                     {x.detail ? <div className="opacity-60 break-words">{x.detail}</div> : null}
+  302:                   </div>
+  303:                 ))}
+  304:               </div>
+  305:             )}
+  306:           </div>
+  307: 
+  308:           <div className="text-[11px] opacity-60">
+  309:             Tip: if Connect fails, the red error string is the exact reason. Fix command/args/cwd and retry.
+  310:           </div>
+  311:         </div>
+  312:       ) : null}
+  313:     </div>
+  314:   );
+  315: }
+
+################################################################################
+[FILE] C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx
+    1: import { useEffect, useRef, useState } from "react";
+    2: import ReactMarkdown from "react-markdown";
+    3: import remarkGfm from "remark-gfm";
+    4: import type { ChatThread, Message } from "../types";
+    5: import { useMcp } from "../lib/mcp";
+    6: 
+    7: type Props = {
+    8:   chat: ChatThread | null;
+    9:   onSend: (text: string) => void;
+   10:   isStreaming: boolean;
+   11:   onStop: () => void;
+   12:   onRegenerate?: () => void;
+   13:   canRegenerate?: boolean;
+   14:   onClearStatus?: () => void;
+   15: };
+   16: 
+   17: function sanitizeLegacyStatusLines(s: string) {
+   18:   if (!s) return s;
+   19:   const lines = s.split(/\r?\n/);
+   20:   const filtered = lines.filter((ln) => {
+   21:     const t = ln.trim();
+   22:     if (!t) return true;
+   23:     if (t.startsWith("Running:")) return false;
+   24:     if (t.startsWith("Done:")) return false;
+   25:     return true;
+   26:   });
+   27:   return filtered.join("\n").trim();
+   28: }
+   29: 
+   30: function guardIdentityDisplay(text: string) {
+   31:   const s = (text || "").trimStart();
+   32:   const head = s.slice(0, 220).toLowerCase();
+   33: 
+   34:   const bad =
+   35:     head.startsWith("yes, i am kimi") ||
+   36:     head.startsWith("i am kimi") ||
+   37:     head.startsWith("i'm kimi") ||
+   38:     head.startsWith("yes, i'm kimi") ||
+   39:     head.startsWith("yes, i am claude") ||
+   40:     head.startsWith("i am claude") ||
+   41:     head.startsWith("i'm claude") ||
+   42:     head.startsWith("yes, i am chatgpt") ||
+   43:     head.startsWith("i am chatgpt") ||
+   44:     head.startsWith("i'm chatgpt") ||
+   45:     head.includes("created by moonshot") ||
+   46:     head.includes("moonshot ai");
+   47: 
+   48:   if (!bad) return text;
+   49: 
+   50:   const lines = s.split(/\r?\n/);
+   51:   lines[0] = "I’m Nikolai Desktop (local). How can I help?";
+   52:   return lines.join("\n");
+   53: }
+   54: 
+   55: async function copyToClipboard(text: string) {
+   56:   try {
+   57:     await navigator.clipboard.writeText(text);
+   58:     return true;
+   59:   } catch {
+   60:     return false;
+   61:   }
+   62: }
+   63: 
+   64: function downloadMarkdown(filename: string, content: string) {
+   65:   const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+   66:   const url = URL.createObjectURL(blob);
+   67:   const a = document.createElement("a");
+   68:   a.href = url;
+   69:   a.download = filename;
+   70:   document.body.appendChild(a);
+   71:   a.click();
+   72:   a.remove();
+   73:   URL.revokeObjectURL(url);
+   74: }
+   75: 
+   76: function Avatar({ kind }: { kind: "user" | "assistant" }) {
+   77:   const label = kind === "assistant" ? "N" : "U";
+   78:   const cls =
+   79:     kind === "assistant"
+   80:       ? "bg-white/10 border border-white/15 text-white/90"
+   81:       : "bg-blue-600/30 border border-blue-500/30 text-blue-100";
+   82: 
+   83:   return (
+   84:     <div className={`h-7 w-7 rounded-full flex items-center justify-center text-xs font-semibold ${cls}`}>
+   85:       {label}
+   86:     </div>
+   87:   );
+   88: }
+   89: 
+   90: function CodeBlock({ code }: { code: string }) {
+   91:   const [copied, setCopied] = useState(false);
+   92: 
+   93:   return (
+   94:     <div className="relative my-2">
+   95:       <button
+   96:         className="absolute top-2 right-2 text-[11px] px-2 py-1 rounded bg-white/10 hover:bg-white/15 border border-white/10"
+   97:         onClick={async () => {
+   98:           const ok = await copyToClipboard(code);
+   99:           if (ok) {
+  100:             setCopied(true);
+  101:             setTimeout(() => setCopied(false), 1200);
+  102:           }
+  103:         }}
+  104:       >
+  105:         {copied ? "Copied" : "Copy"}
+  106:       </button>
+  107:       <pre className="text-xs whitespace-pre overflow-x-auto rounded-lg bg-black/40 border border-white/10 p-3">
+  108:         <code>{code}</code>
+  109:       </pre>
+  110:     </div>
+  111:   );
+  112: }
+  113: 
+  114: function Md({ text }: { text: string }) {
+  115:   return (
+  116:     <ReactMarkdown
+  117:       remarkPlugins={[remarkGfm]}
+  118:       components={{
+  119:         p: ({ children }) => <p className="leading-relaxed my-2">{children}</p>,
+  120:         code: ({ children, className }) => {
+  121:           const raw = String(children ?? "");
+  122:           const code = raw.replace(/\n$/, "");
+  123:           const isBlock = (className || "").includes("language-") || raw.includes("\n");
+  124:           if (isBlock) return <CodeBlock code={code} />;
+  125:           return <code className="text-xs rounded bg-black/40 border border-white/10 px-1 py-0.5">{children}</code>;
+  126:         },
+  127:       }}
+  128:     >
+  129:       {text}
+  130:     </ReactMarkdown>
+  131:   );
+  132: }
+  133: 
+  134: export default function ChatCenter({
+  135:   chat,
+  136:   onSend,
+  137:   isStreaming,
+  138:   onStop,
+  139:   onRegenerate,
+  140:   canRegenerate,
+  141:   onClearStatus,
+  142: }: Props) {
+  143:   const [text, setText] = useState("");
+  144:   const endRef = useRef<HTMLDivElement | null>(null);
+  145:   // Shared MCP state from hook (single source of truth)
+  146:   const { mcpState, tools, error, connected, connect, refreshTools } = useMcp();
+  147:   const mcpConnected = mcpState === "connected";
+  148:   
+  149:   const toolCount = tools.length > 0 ? tools.length : null;
+  150: 
+  151:   const [mcpReconnectBusy, setMcpReconnectBusy] = useState(false);
+  152:   const [mcpReconnectErr, setMcpReconnectErr] = useState<string | null>(null);
+  153:   const [mcpDegraded, setMcpDegraded] = useState(false);
+  154:   const [mcpLastErr, setMcpLastErr] = useState<string | null>(null);
+  155:   const mcpFailRef = useRef<number>(0);
+  156: 
+  157:   const reconnectMcp = async () => {
+  158:     setMcpReconnectBusy(true);
+  159:     setMcpReconnectErr(null);
+  160:     setMcpLastErr(null);
+  161:     setMcpDegraded(false);
+  162:     mcpFailRef.current = 0;
+  163: 
+  164:     try {
+  165:       const raw = localStorage.getItem("nikolai.mcp.stdio.v1");
+  166:       if (!raw) throw new Error("No MCP config saved. Open Tools tab → Connect once.");
+  167: 
+  168:       const cfg = JSON.parse(raw);
+  169:       const command = String(cfg?.command || "").trim();
+  170:       if (!command) throw new Error("MCP config missing command. Tools tab → Connect once.");
+  171: 
+  172:       const cwd = cfg?.cwd?.trim() || null;
+  173:       let argsArr: string[] = [];
+  174: 
+  175:       if (Array.isArray(cfg?.args)) {
+  176:         argsArr = cfg.args.map((x: any) => String(x)).filter(Boolean);
+  177:       } else if (typeof cfg?.args === "string") {
+  178:         argsArr = cfg.args.trim().split(/\s+/).filter(Boolean);
+  179:       }
+  180: 
+  181:       await connect({ command, args: argsArr, cwd });
+  182:     } catch (e: any) {
+  183:       setMcpReconnectErr(e?.message || String(e));
+  184:     } finally {
+  185:       setMcpReconnectBusy(false);
+  186:     }
+  187:   };
+  188: 
+  189:   // Track degraded state based on error
+  190:   useEffect(() => {
+  191:     if (error) {
+  192:       mcpFailRef.current += 1;
+  193:       setMcpLastErr(error);
+  194:       if (mcpFailRef.current >= 3) setMcpDegraded(true);
+  195:     } else if (connected) {
+  196:       setMcpLastErr(null);
+  197:       setMcpDegraded(false);
+  198:       mcpFailRef.current = 0;
+  199:     }
+  200:   }, [error, connected]);
+  201: 
+  202:   useEffect(() => {
+  203:     endRef.current?.scrollIntoView({ behavior: "smooth" });
+  204:   }, [chat?.messages.length]);
+  205: 
+  206:   if (!chat) {
+  207:     return <div className="h-full flex items-center justify-center text-sm opacity-70">Create a chat from the left panel.</div>;
+  208:   }
+  209: 
+  210:   return (
+  211:     <div className="h-full flex flex-col">
+  212:       <div className="h-12 flex items-center justify-between px-4 border-b border-white/10">
+  213:         <div className="font-semibold">{chat.title}</div>
+  214: 
+  215:         <div className="text-xs flex items-center gap-2">
+  216:           {isStreaming ? <span className="text-green-300">• streaming</span> : <span>idle</span>}
+  217:           <span>Messages: {chat.messages.length}</span>
+  218: 
+  219:           <span className={`px-2 py-0.5 rounded border border-white/10 ${mcpConnected ? "bg-white/10" : ""}`}>
+  220:             MCP: {mcpState}
+  221:           </span>
+  222: 
+  223:           {(mcpState !== "connected" || mcpDegraded) && (
+  224:             <button
+  225:               className="px-2 py-0.5 rounded border border-white/10 bg-white/5 hover:bg-white/10 disabled:opacity-50"
+  226:               onClick={reconnectMcp}
+  227:               disabled={mcpReconnectBusy}
+  228:               title={mcpReconnectErr || mcpLastErr || "Reconnect MCP"}
+  229:             >
+  230:               {mcpReconnectBusy ? "Reconnecting…" : "Reconnect"}
+  231:             </button>
+  232:           )}
+  233: 
+  234:           <span className="px-2 py-0.5 rounded border border-white/10 bg-white/5">
+  235:             Tools: {toolCount === null ? "—" : toolCount}
+  236:           </span>
+  237: 
+  238:           {mcpConnected && (
+  239:             <button
+  240:               className="px-2 py-0.5 rounded border border-white/10 bg-white/5 hover:bg-white/10"
+  241:               onClick={refreshTools}
+  242:             >
+  243:               Refresh
+  244:             </button>
+  245:           )}
+  246: 
+  247:           {/* EXPORT BUTTON RESTORED */}
+  248:           <button
+  249:             className="px-2 py-1 rounded bg-white/10 hover:bg-white/15 border border-white/10"
+  250:             onClick={() => {
+  251:               const safeTitle = (chat.title || "chat")
+  252:                 .replace(/[\\\/:*?"<>|]+/g, "_")
+  253:                 .trim() || "chat";
+  254: 
+  255:               const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  256:               const filename = `${safeTitle}_${ts}.md`;
+  257: 
+  258:               const md = [
+  259:                 `# ${chat.title || "Chat"}`,
+  260:                 "",
+  261:                 ...chat.messages.map((m) => {
+  262:                   const role =
+  263:                     m.role === "user"
+  264:                       ? "User"
+  265:                       : m.role === "assistant"
+  266:                       ? "Assistant"
+  267:                       : m.role;
+  268: 
+  269:                   return `## ${role}\n\n${String(m.content || "")}\n`;
+  270:                 }),
+  271:               ].join("\n");
+  272: 
+  273:               downloadMarkdown(filename, md);
+  274:             }}
+  275:           >
+  276:             Export
+  277:           </button>
+  278: 
+  279:           <button
+  280:             className="px-2 py-1 rounded bg-white/10 hover:bg-white/15 border border-white/10"
+  281:             onClick={() => onClearStatus?.()}
+  282:           >
+  283:             Clear
+  284:           </button>
+  285:         </div>
+  286:       </div>
+  287: 
+  288:       <div className="flex-1 overflow-auto p-4 space-y-6">
+  289:         {chat.messages.map((m, idx) => (
+  290:           <MessageBubble
+  291:             key={m.id}
+  292:             m={m}
+  293:             isLast={idx === chat.messages.length - 1}
+  294:             canRegenerate={!!canRegenerate}
+  295:             onRegenerate={onRegenerate}
+  296:           />
+  297:         ))}
+  298:         <div ref={endRef} />
+  299:       </div>
+  300: 
+  301:       <div className="border-t border-white/10 p-3">
+  302:         <div className="flex gap-2">
+  303:           <textarea
+  304:             value={text}
+  305:             onChange={(e) => setText(e.target.value)}
+  306:             rows={2}
+  307:             placeholder="Type a message..."
+  308:             className="flex-1 resize-none rounded-md bg-white/5 border border-white/10 px-3 py-2 text-sm outline-none focus:border-white/30"
+  309:             onKeyDown={(e) => {
+  310:               if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+  311:                 e.preventDefault();
+  312:                 const t = text.trim();
+  313:                 if (!t) return;
+  314:                 onSend(t);
+  315:                 setText("");
+  316:               }
+  317:             }}
+  318:             disabled={isStreaming}
+  319:           />
+  320: 
+  321:           {!isStreaming ? (
+  322:             <button
+  323:               className="rounded-md bg-blue-600 hover:bg-blue-500 px-4 py-2 text-sm font-semibold disabled:opacity-50"
+  324:               onClick={() => {
+  325:                 const t = text.trim();
+  326:                 if (!t) return;
+  327:                 onSend(t);
+  328:                 setText("");
+  329:               }}
+  330:               disabled={!text.trim()}
+  331:             >
+  332:               Send
+  333:             </button>
+  334:           ) : (
+  335:             <button
+  336:               className="rounded-md bg-amber-600 hover:bg-amber-500 px-4 py-2 text-sm font-semibold"
+  337:               onClick={onStop}
+  338:             >
+  339:               Stop
+  340:             </button>
+  341:           )}
+  342:         </div>
+  343:       </div>
+  344:     </div>
+  345:   );
+  346: }
+  347: 
+  348: function MessageBubble({
+  349:   m,
+  350:   isLast,
+  351:   canRegenerate,
+  352:   onRegenerate,
+  353: }: {
+  354:   m: Message;
+  355:   isLast: boolean;
+  356:   canRegenerate: boolean;
+  357:   onRegenerate?: () => void;
+  358: }) {
+  359:   const isUser = m.role === "user";
+  360:   const isStatus = !isUser && typeof m.content === "string" && m.content.startsWith("__STATUS__:");
+  361:   const statusText = isStatus ? m.content.replace("__STATUS__:", "").trim() : "";
+  362: 
+  363:   let content = sanitizeLegacyStatusLines(String(m.content || ""));
+  364:   if (!isUser && !isStatus) content = guardIdentityDisplay(content);
+  365: 
+  366:   return (
+  367:     <div className={`flex gap-3 ${isUser ? "justify-end" : "justify-start"}`}>
+  368:       {!isUser && <Avatar kind="assistant" />}
+  369: 
+  370:       <div
+  371:         className={`group max-w-[65%] rounded-2xl px-5 py-4 border relative ${
+  372:           isUser ? "bg-blue-600/20 border-blue-500/30" : "bg-white/5 border-white/10"
+  373:         }`}
+  374:       >
+  375:         {!isStatus && (
+  376:           <div className="absolute top-2 right-2 flex gap-2">
+  377:             <button
+  378:               className="text-[11px] px-2 py-1 rounded bg-white/10 hover:bg-white/15 border border-white/10"
+  379:               onClick={() => copyToClipboard(content)}
+  380:             >
+  381:               Copy
+  382:             </button>
+  383: 
+  384:             {!isUser && isLast && canRegenerate && onRegenerate && (
+  385:               <button
+  386:                 className="text-[11px] px-2 py-1 rounded bg-white/10 hover:bg-white/15 border border-white/10"
+  387:                 onClick={onRegenerate}
+  388:               >
+  389:                 Regen
+  390:               </button>
+  391:             )}
+  392:           </div>
+  393:         )}
+  394: 
+  395:         {isStatus ? (
+  396:           <div className="inline-flex items-center gap-2 text-xs opacity-85">
+  397:             <span className="h-3 w-3 rounded-full border border-white/30 border-t-white/80 animate-spin" />
+  398:             <span>{statusText || "Working..."}</span>
+  399:           </div>
+  400:         ) : (
+  401:           <>
+  402:             <div className="text-sm">
+  403:               {isUser ? (
+  404:                 <div className="whitespace-pre-wrap leading-relaxed">{content}</div>
+  405:               ) : (
+  406:                 <Md text={content} />
+  407:               )}
+  408:             </div>
+  409:             <div className="mt-3 pt-2 border-t border-white/5 text-[10px] opacity-40 text-right">
+  410:               {new Date(m.ts).toLocaleTimeString()}
+  411:             </div>
+  412:           </>
+  413:         )}
+  414:       </div>
+  415: 
+  416:       {isUser && <Avatar kind="user" />}
+  417:     </div>
+  418:   );
+  419: }
+
+################################################################################
+[FILE] C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs
+    1: use once_cell::sync::OnceCell;
+    2: use serde::{Deserialize, Serialize};
+    3: use serde_json::{json, Value};
+    4: use std::{
+    5:   collections::HashMap,
+    6:   process::Stdio,
+    7:   sync::{
+    8:     atomic::{AtomicU64, Ordering},
+    9:     Arc,
+   10:   },
+   11:   time::{Duration, SystemTime, UNIX_EPOCH},
+   12: };
+   13: use tokio::{
+   14:   io::{AsyncReadExt, AsyncWriteExt},
+   15:   process::{Child, ChildStdin, ChildStdout, Command},
+   16:   sync::{oneshot, Mutex},
+   17:   time::timeout,
+   18: };
+   19: use tauri::{AppHandle, Manager};
+   20: 
+   21: const MCP_TIMEOUT_SECS: u64 = 60;
+   22: const MAX_BUFFER_SIZE: usize = 10 * 1024 * 1024; // 10MB
+   23: const INITIALIZATION_TIMEOUT_SECS: u64 = 30;
+   24: const KILL_WAIT_TIMEOUT_SECS: u64 = 5;
+   25: 
+   26: #[derive(Debug, Clone, Deserialize)]
+   27: pub struct McpConnectConfig {
+   28:   pub command: String,
+   29:   pub args: Vec<String>,
+   30:   pub cwd: Option<String>,
+   31: }
+   32: 
+   33: #[derive(Debug, Clone, Serialize)]
+   34: pub struct McpStatus {
+   35:   pub connected: bool,
+   36:   pub command: Option<String>,
+   37:   pub cwd: Option<String>,
+   38: }
+   39: 
+   40: #[derive(Debug, Clone, Serialize)]
+   41: pub struct McpTool {
+   42:   pub name: String,
+   43:   #[serde(skip_serializing_if = "Option::is_none")]
+   44:   pub description: Option<String>,
+   45:   #[serde(rename = "inputSchema", skip_serializing_if = "Option::is_none")]
+   46:   pub input_schema: Option<Value>,
+   47: }
+   48: 
+   49: #[derive(Debug, Clone, Serialize)]
+   50: pub struct McpInfo {
+   51:   pub timeout_secs: u64,
+   52:   pub protocol_version: String,
+   53: }
+   54: 
+   55: type PendingMap = HashMap<u64, oneshot::Sender<Result<Value, Value>>>;
+   56: 
+   57: struct McpClient {
+   58:   child: Mutex<Child>,
+   59:   stdin: Mutex<ChildStdin>,
+   60:   pending: Mutex<PendingMap>,
+   61:   next_id: AtomicU64,
+   62:   command: String,
+   63:   cwd: Option<String>,
+   64:   // Reader task handle for cleanup
+   65:   _reader_abort: tokio::sync::Mutex<Option<tokio::task::AbortHandle>>,
+   66: }
+   67: 
+   68: // State machine for MCP connection lifecycle
+   69: #[derive(Clone)]
+   70: enum McpState {
+   71:   Disconnected,
+   72:   Connecting {
+   73:     started_at: u64,
+   74:     cfg_summary: String,
+   75:   },
+   76:   Connected {
+   77:     client: Arc<McpClient>,
+   78:     connected_at: u64,
+   79:   },
+   80:   Error {
+   81:     message: String,
+   82:     at: u64,
+   83:   },
+   84: }
+   85: 
+   86: static MCP: OnceCell<Mutex<McpState>> = OnceCell::new();
+   87: 
+   88: fn ensure_state() -> &'static Mutex<McpState> {
+   89:   MCP.get_or_init(|| Mutex::new(McpState::Disconnected))
+   90: }
+   91: 
+   92: fn now_millis() -> u64 {
+   93:   SystemTime::now()
+   94:     .duration_since(UNIX_EPOCH)
+   95:     .unwrap_or_default()
+   96:     .as_millis() as u64
+   97: }
+   98: 
+   99: fn emit_state_change(app: &AppHandle, state: &str, message: Option<String>) {
+  100:   let payload = json!({
+  101:     "state": state,
+  102:     "message": message,
+  103:     "ts": now_millis()
+  104:   });
+  105:   let _ = app.emit_all("mcp://state", payload);
+  106: }
+  107: 
+  108: async fn fail_all_pending(client: &McpClient, error: &str) {
+  109:   let mut pending = client.pending.lock().await;
+  110:   for (_, tx) in pending.drain() {
+  111:     let _ = tx.send(Err(json!(error)));
+  112:   }
+  113: }
+  114: 
+  115: async fn handle_message(raw: &str, client: &Arc<McpClient>, _app: &AppHandle) {
+  116:   let v: Value = match serde_json::from_str(raw) {
+  117:     Ok(v) => v,
+  118:     Err(e) => {
+  119:       // Log safely with truncation
+  120:       let preview = if raw.len() > 200 { &raw[..200] } else { raw };
+  121:       eprintln!("[mcp] JSON parse error: {}, input: {}", e, preview);
+  122:       return;
+  123:     }
+  124:   };
+  125: 
+  126:   let id = match v.get("id").and_then(|x| x.as_u64()) {
+  127:     Some(id) => id,
+  128:     None => return,
+  129:   };
+  130: 
+  131:   let result = if v.get("error").is_some() {
+  132:     Err(v.get("error").cloned().unwrap_or(Value::Null))
+  133:   } else {
+  134:     Ok(v.get("result").cloned().unwrap_or(Value::Null))
+  135:   };
+  136: 
+  137:   let mut pending = client.pending.lock().await;
+  138:   if let Some(tx) = pending.remove(&id) {
+  139:     let _ = tx.send(result);
+  140:   }
+  141: }
+  142: 
+  143: async fn reader_loop(
+  144:   mut out: ChildStdout,
+  145:   client: Arc<McpClient>,
+  146:   app: AppHandle,
+  147:   read_state: Arc<Mutex<McpState>>,
+  148: ) {
+  149:   let mut buf: Vec<u8> = Vec::with_capacity(8192);
+  150:   let mut tmp = [0u8; 4096];
+  151: 
+  152:   loop {
+  153:     let n = match out.read(&mut tmp).await {
+  154:       Ok(0) => break,
+  155:       Ok(n) => n,
+  156:       Err(e) => {
+  157:         eprintln!("[mcp] read error: {}", e);
+  158:         break;
+  159:       }
+  160:     };
+  161: 
+  162:     buf.extend_from_slice(&tmp[..n]);
+  163: 
+  164:     // Check buffer overflow
+  165:     if buf.len() > MAX_BUFFER_SIZE {
+  166:       eprintln!("[mcp] Buffer overflow: {} bytes exceeds limit of {}", buf.len(), MAX_BUFFER_SIZE);
+  167:       
+  168:       // Transition to Error state
+  169:       let mut state = read_state.lock().await;
+  170:       if let McpState::Connected { ref client, .. } = *state {
+  171:         // Fail all pending requests
+  172:         fail_all_pending(client, "Buffer overflow").await;
+  173:       }
+  174:       *state = McpState::Error {
+  175:         message: "Buffer overflow: MCP server sent too much data".to_string(),
+  176:         at: now_millis(),
+  177:       };
+  178:       emit_state_change(&app, "error", Some("Buffer overflow".to_string()));
+  179:       return;
+  180:     }
+  181: 
+  182:     loop {
+  183:       let s = match std::str::from_utf8(&buf) {
+  184:         Ok(s) => s,
+  185:         Err(_) => break,
+  186:       };
+  187: 
+  188:       // Support LSP-style Content-Length framing
+  189:       if s.starts_with("Content-Length:") {
+  190:         if let Some(hdr_end) = s.find("\r\n\r\n") {
+  191:           let headers = &s[..hdr_end];
+  192:           let mut len: usize = 0;
+  193: 
+  194:           for line in headers.lines() {
+  195:             if let Some(v) = line.strip_prefix("Content-Length:") {
+  196:               len = v.trim().parse::<usize>().unwrap_or(0);
+  197:             }
+  198:           }
+  199: 
+  200:           let total_needed = hdr_end + 4 + len;
+  201:           if buf.len() < total_needed {
+  202:             break;
+  203:           }
+  204: 
+  205:           let json_bytes = buf[(hdr_end + 4)..(hdr_end + 4 + len)].to_vec();
+  206:           let json_str = String::from_utf8_lossy(&json_bytes).to_string();
+  207:           buf.drain(0..total_needed);
+  208: 
+  209:           handle_message(&json_str, &client, &app).await;
+  210:           continue;
+  211:         }
+  212:         break;
+  213:       }
+  214: 
+  215:       // Newline-delimited JSON
+  216:       if let Some(pos) = s.find('\n') {
+  217:         let line = s[..pos].trim().to_string();
+  218:         buf.drain(0..pos + 1);
+  219: 
+  220:         if !line.is_empty() {
+  221:           handle_message(&line, &client, &app).await;
+  222:         }
+  223:         continue;
+  224:       }
+  225: 
+  226:       break;
+  227:     }
+  228:   }
+  229: 
+  230:   // EOF reached - normal exit
+  231:   eprintln!("[mcp] Reader loop exiting (EOF)");
+  232: }
+  233: 
+  234: async fn notify_with_client(client: Arc<McpClient>, method: &str, params: Value) -> Result<(), String> {
+  235:   let msg = json!({
+  236:     "jsonrpc": "2.0",
+  237:     "method": method,
+  238:     "params": params
+  239:   });
+  240:   let text = msg.to_string() + "\n";
+  241: 
+  242:   let mut stdin = client.stdin.lock().await;
+  243:   stdin
+  244:     .write_all(text.as_bytes())
+  245:     .await
+  246:     .map_err(|e| format!("stdin write failed: {}", e))?;
+  247:   stdin.flush().await.map_err(|e| format!("stdin flush failed: {}", e))?;
+  248:   Ok(())
+  249: }
+  250: 
+  251: async fn request_with_client(client: Arc<McpClient>, method: &str, params: Value) -> Result<Value, String> {
+  252:   let id = client.next_id.fetch_add(1, Ordering::SeqCst);
+  253: 
+  254:   let req = json!({
+  255:     "jsonrpc":"2.0",
+  256:     "id": id,
+  257:     "method": method,
+  258:     "params": params
+  259:   });
+  260: 
+  261:   let (tx, rx) = oneshot::channel::<Result<Value, Value>>();
+  262:   {
+  263:     let mut pending = client.pending.lock().await;
+  264:     pending.insert(id, tx);
+  265:   }
+  266: 
+  267:   {
+  268:     let mut stdin = client.stdin.lock().await;
+  269:     let line = req.to_string() + "\n";
+  270:     stdin.write_all(line.as_bytes()).await.map_err(|e| e.to_string())?;
+  271:     stdin.flush().await.map_err(|e| e.to_string())?;
+  272:   }
+  273: 
+  274:   match timeout(Duration::from_secs(MCP_TIMEOUT_SECS), rx).await {
+  275:     Ok(Ok(Ok(v))) => Ok(v),
+  276:     Ok(Ok(Err(e))) => Err(format!("MCP error: {}", e)),
+  277:     Ok(Err(_)) => Err("MCP response channel closed".to_string()),
+  278:     Err(_) => Err("MCP timeout".to_string()),
+  279:   }
+  280: }
+  281: 
+  282: async fn request(method: &str, params: Value) -> Result<Value, String> {
+  283:   let state = ensure_state();
+  284:   let client = {
+  285:     let guard = state.lock().await;
+  286:     match &*guard {
+  287:       McpState::Connected { client, .. } => client.clone(),
+  288:       _ => return Err("MCP not connected".to_string()),
+  289:     }
+  290:   };
+  291:   request_with_client(client, method, params).await
+  292: }
+  293: 
+  294: #[tauri::command]
+  295: pub async fn mcp_status() -> McpStatus {
+  296:   let state = ensure_state();
+  297:   let guard = state.lock().await;
+  298: 
+  299:   match &*guard {
+  300:     McpState::Connected { client, .. } => McpStatus {
+  301:       connected: true,
+  302:       command: Some(client.command.clone()),
+  303:       cwd: client.cwd.clone(),
+  304:     },
+  305:     _ => McpStatus {
+  306:       connected: false,
+  307:       command: None,
+  308:       cwd: None,
+  309:     },
+  310:   }
+  311: }
+  312: 
+  313: #[tauri::command]
+  314: pub async fn mcp_info() -> McpInfo {
+  315:   McpInfo {
+  316:     timeout_secs: MCP_TIMEOUT_SECS,
+  317:     protocol_version: "2024-11-05".to_string(),
+  318:   }
+  319: }
+  320: 
+  321: #[tauri::command]
+  322: pub async fn mcp_connect(
+  323:   cfg: McpConnectConfig,
+  324:   app: AppHandle,
+  325: ) -> Result<McpStatus, String> {
+  326:   let state = ensure_state();
+  327:   let cfg_summary = format!("{} {}", cfg.command, cfg.args.join(" "));
+  328:   
+  329:   // Atomic check-and-transition under ONE lock
+  330:   let transition_result = {
+  331:     let mut guard = state.lock().await;
+  332:     match &*guard {
+  333:       McpState::Disconnected | McpState::Error { .. } => {
+  334:         // Can start new connection
+  335:         *guard = McpState::Connecting {
+  336:           started_at: now_millis(),
+  337:           cfg_summary: cfg_summary.clone(),
+  338:         };
+  339:         emit_state_change(&app, "connecting", Some(cfg_summary.clone()));
+  340:         Ok(())
+  341:       }
+  342:       McpState::Connecting { .. } | McpState::Connected { .. } => {
+  343:         // Already connecting or connected
+  344:         Err("Already connected or connecting".to_string())
+  345:       }
+  346:     }
+  347:   };
+  348: 
+  349:   // If transition failed, return current status
+  350:   if let Err(_) = transition_result {
+  351:     return Ok(mcp_status().await);
+  352:   }
+  353: 
+  354:   // Validate command
+  355:   if cfg.command.trim().is_empty() {
+  356:     let mut guard = state.lock().await;
+  357:     *guard = McpState::Error {
+  358:       message: "Command is empty".to_string(),
+  359:       at: now_millis(),
+  360:     };
+  361:     emit_state_change(&app, "error", Some("Command is empty".to_string()));
+  362:     return Err("Command is empty".to_string());
+  363:   }
+  364: 
+  365:   // Spawn child process
+  366:   let mut cmd = Command::new(&cfg.command);
+  367:   cmd.args(&cfg.args)
+  368:     .stdin(Stdio::piped())
+  369:     .stdout(Stdio::piped())
+  370:     .stderr(Stdio::inherit());
+  371: 
+  372:   if let Some(cwd) = &cfg.cwd {
+  373:     if !cwd.trim().is_empty() {
+  374:       cmd.current_dir(cwd);
+  375:     }
+  376:   }
+  377: 
+  378:   let mut child = match cmd.spawn() {
+  379:     Ok(c) => c,
+  380:     Err(e) => {
+  381:       let mut guard = state.lock().await;
+  382:       *guard = McpState::Error {
+  383:         message: format!("spawn failed: {}", e),
+  384:         at: now_millis(),
+  385:       };
+  386:       emit_state_change(&app, "error", Some(format!("spawn failed: {}", e)));
+  387:       return Err(format!("spawn failed: {}", e));
+  388:     }
+  389:   };
+  390: 
+  391:   let stdin = child.stdin.take().ok_or("Failed to open stdin")?;
+  392:   let stdout = child.stdout.take().ok_or("Failed to open stdout")?;
+  393: 
+  394:   let client = Arc::new(McpClient {
+  395:     child: Mutex::new(child),
+  396:     stdin: Mutex::new(stdin),
+  397:     pending: Mutex::new(HashMap::new()),
+  398:     next_id: AtomicU64::new(1),
+  399:     command: cfg.command.clone(),
+  400:     cwd: cfg.cwd.clone(),
+  401:     _reader_abort: tokio::sync::Mutex::new(None),
+  402:   });
+  403: 
+  404:   // Start reader loop
+  405:   let c_out = client.clone();
+  406:   let app_clone = app.clone();
+  407:   let state_for_reader = Arc::new(Mutex::new(McpState::Disconnected));
+  408:   {
+  409:     let mut guard = state_for_reader.lock().await;
+  410:     *guard = McpState::Connecting {
+  411:       started_at: now_millis(),
+  412:       cfg_summary: cfg_summary.clone(),
+  413:     };
+  414:   }
+  415:   let reader_state = state_for_reader.clone();
+  416:   
+  417:   let reader_handle = tokio::spawn(async move {
+  418:     reader_loop(stdout, c_out, app_clone, reader_state).await;
+  419:   });
+  420:   
+  421:   // Store abort handle
+  422:   {
+  423:     let mut abort = client._reader_abort.lock().await;
+  424:     *abort = Some(reader_handle.abort_handle());
+  425:   }
+  426: 
+  427:   // Initialize with timeout
+  428:   let init_result = timeout(
+  429:     Duration::from_secs(INITIALIZATION_TIMEOUT_SECS),
+  430:     request_with_client(
+  431:       client.clone(),
+  432:       "initialize",
+  433:       json!({
+  434:         "protocolVersion": "2024-11-05",
+  435:         "clientInfo": { "name":"Nikolai Desktop", "version":"0.1.0" },
+  436:         "capabilities": { "tools": {} }
+  437:       }),
+  438:     )
+  439:   ).await;
+  440: 
+  441:   // Update the reader state reference
+  442:   {
+  443:     let mut rs = state_for_reader.lock().await;
+  444:     *rs = McpState::Connected {
+  445:       client: client.clone(),
+  446:       connected_at: now_millis(),
+  447:     };
+  448:   }
+  449: 
+  450:   match init_result {
+  451:     Ok(Ok(_)) => {
+  452:       // Initialization successful
+  453:       let _ = notify_with_client(client.clone(), "notifications/initialized", json!({})).await;
+  454:       
+  455:       // Transition to Connected
+  456:       let mut guard = state.lock().await;
+  457:       *guard = McpState::Connected {
+  458:         client: client.clone(),
+  459:         connected_at: now_millis(),
+  460:       };
+  461:       emit_state_change(&app, "connected", None);
+  462:       
+  463:       println!("[mcp] initialize success");
+  464:       Ok(mcp_status().await)
+  465:     }
+  466:     Ok(Err(e)) => {
+  467:       // Initialization failed with error
+  468:       eprintln!("[mcp] initialization failed: {}", e);
+  469:       
+  470:       // Cleanup child
+  471:       {
+  472:         let mut child = client.child.lock().await;
+  473:         let _ = child.start_kill();
+  474:         let _ = timeout(Duration::from_secs(KILL_WAIT_TIMEOUT_SECS), child.wait()).await;
+  475:       }
+  476:       
+  477:       // Abort reader
+  478:       if let Some(abort) = client._reader_abort.lock().await.take() {
+  479:         abort.abort();
+  480:       }
+  481:       
+  482:       // Fail all pending
+  483:       fail_all_pending(&client, "Initialization failed").await;
+  484:       
+  485:       // Transition to Error
+  486:       let mut guard = state.lock().await;
+  487:       *guard = McpState::Error {
+  488:         message: format!("Initialization failed: {}", e),
+  489:         at: now_millis(),
+  490:       };
+  491:       emit_state_change(&app, "error", Some(format!("Initialization failed: {}", e)));
+  492:       
+  493:       Err(format!("Initialization failed: {}", e))
+  494:     }
+  495:     Err(_elapsed) => {
+  496:       // Initialization timed out
+  497:       eprintln!("[mcp] initialization timed out");
+  498:       
+  499:       // Cleanup child
+  500:       {
+  501:         let mut child = client.child.lock().await;
+  502:         let _ = child.start_kill();
+  503:         let _ = timeout(Duration::from_secs(KILL_WAIT_TIMEOUT_SECS), child.wait()).await;
+  504:       }
+  505:       
+  506:       // Abort reader
+  507:       if let Some(abort) = client._reader_abort.lock().await.take() {
+  508:         abort.abort();
+  509:       }
+  510:       
+  511:       // Fail all pending
+  512:       fail_all_pending(&client, "Initialization timed out").await;
+  513:       
+  514:       // Transition to Error
+  515:       let mut guard = state.lock().await;
+  516:       *guard = McpState::Error {
+  517:         message: "Initialization timed out".to_string(),
+  518:         at: now_millis(),
+  519:       };
+  520:       emit_state_change(&app, "error", Some("Initialization timed out".to_string()));
+  521:       
+  522:       Err("Initialization timed out".to_string())
+  523:     }
+  524:   }
+  525: }
+  526: 
+  527: #[tauri::command]
+  528: pub async fn mcp_disconnect(app: AppHandle) -> Result<McpStatus, String> {
+  529:   let state = ensure_state();
+  530:   
+  531:   // Transition state and extract client
+  532:   let client_opt = {
+  533:     let mut guard = state.lock().await;
+  534:     let current = std::mem::replace(&mut *guard, McpState::Disconnected);
+  535:     match current {
+  536:       McpState::Connected { client, .. } => Some(client),
+  537:       _ => None,
+  538:     }
+  539:   };
+  540: 
+  541:   emit_state_change(&app, "disconnected", None);
+  542: 
+  543:   if let Some(client) = client_opt {
+  544:     // Abort reader task first
+  545:     if let Some(abort) = client._reader_abort.lock().await.take() {
+  546:       abort.abort();
+  547:     }
+  548:     
+  549:     // Fail all pending requests
+  550:     fail_all_pending(&client, "Disconnected").await;
+  551:     
+  552:     // Kill child and wait
+  553:     let mut child = client.child.lock().await;
+  554:     let _ = child.start_kill();
+  555:     let _ = timeout(Duration::from_secs(KILL_WAIT_TIMEOUT_SECS), child.wait()).await;
+  556:   }
+  557: 
+  558:   Ok(mcp_status().await)
+  559: }
+  560: 
+  561: #[tauri::command]
+  562: pub async fn mcp_list_tools() -> Result<Vec<McpTool>, String> {
+  563:   let v = request("tools/list", json!({})).await?;
+  564:   let tools = v.get("tools").cloned().unwrap_or(Value::Array(vec![]));
+  565: 
+  566:   let mut out: Vec<McpTool> = vec![];
+  567:   if let Value::Array(arr) = tools {
+  568:     for t in arr {
+  569:       let name = t.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+  570:       if name.is_empty() {
+  571:         continue;
+  572:       }
+  573:       let description = t.get("description").and_then(|x| x.as_str()).map(|s| s.to_string());
+  574:       let input_schema = t.get("inputSchema").cloned().or_else(|| t.get("input_schema").cloned());
+  575:       out.push(McpTool { name, description, input_schema });
+  576:     }
+  577:   }
+  578: 
+  579:   Ok(out)
+  580: }
+  581: 
+  582: #[tauri::command]
+  583: pub async fn mcp_call_tool(name: String, args: Value) -> Result<Value, String> {
+  584:   let v = request(
+  585:     "tools/call",
+  586:     json!({
+  587:       "name": name,
+  588:       "arguments": args
+  589:     }),
+  590:   )
+  591:   .await?;
+  592: 
+  593:   Ok(v)
+  594: }
+
+################################################################################
+[FILE] C:\Dev\Nikolai-desktop\package.json
+    1: {
+    2:   "name": "nikolai-desktop",
+    3:   "private": true,
+    4:   "version": "0.0.0",
+    5:   "type": "module",
+    6:   "scripts": {
+    7:     "dev": "vite",
+    8:     "build": "tsc -b && vite build",
+    9:     "lint": "eslint \"src/**/*.{ts,tsx}\"",
+   10:     "typecheck": "tsc -p tsconfig.json --noEmit",
+   11:     "preview": "vite preview"
+   12:   },
+   13:   "dependencies": {
+   14:     "@tauri-apps/api": "1.5.0",
+   15:     "diff": "^8.0.3",
+   16:     "react": "^19.2.0",
+   17:     "react-dom": "^19.2.0",
+   18:     "react-markdown": "^10.1.0",
+   19:     "remark-gfm": "^4.0.1"
+   20:   },
+   21:   "devDependencies": {
+   22:     "@eslint/js": "^9.39.1",
+   23:     "@tailwindcss/postcss": "^4.1.18",
+   24:     "@tauri-apps/cli": "1.5.9",
+   25:     "@types/node": "^24.10.1",
+   26:     "@types/react": "^19.2.5",
+   27:     "@types/react-dom": "^19.2.3",
+   28:     "@vitejs/plugin-react": "^5.1.1",
+   29:     "autoprefixer": "^10.4.23",
+   30:     "eslint": "^9.39.1",
+   31:     "eslint-plugin-react-hooks": "^7.0.1",
+   32:     "eslint-plugin-react-refresh": "^0.4.24",
+   33:     "globals": "^16.5.0",
+   34:     "postcss": "^8.5.6",
+   35:     "tailwindcss": "^4.1.18",
+   36:     "typescript": "~5.9.3",
+   37:     "typescript-eslint": "^8.46.4",
+   38:     "vite": "^7.2.4"
+   39:   }
+   40: }
+
+################################################################################
+[FILE] C:\Dev\Nikolai-desktop\src-tauri\tauri.conf.json
+    1: {
+    2:     "$schema":  "../node_modules/@tauri-apps/cli/schema.json",
+    3:     "build":  {
+    4:                   "beforeBuildCommand":  "npm run build",
+    5:                   "beforeDevCommand":  "npm run dev",
+    6:                   "devPath":  "http://127.0.0.1:5180",
+    7:                   "distDir":  "../dist"
+    8:               },
+    9:     "package":  {
+   10:                     "productName":  "Nikolai",
+   11:                     "version":  "0.1.1"
+   12:                 },
+   13:     "tauri":  {
+   14:                   "allowlist":  {
+   15:                                     "all":  false
+   16:                                 },
+   17:                   "bundle":  {
+   18:                                  "active":  true,
+   19:                                  "category":  "DeveloperTool",
+   20:                                  "copyright":  "",
+   21:                                  "deb":  {
+   22:                                              "depends":  [
+   23: 
+   24:                                                          ]
+   25:                                          },
+   26:                                  "externalBin":  [
+   27: 
+   28:                                                  ],
+   29:                                  "icon":  [
+   30:                                               "icons/32x32.png",
+   31:                                               "icons/128x128.png",
+   32:                                               "icons/128x128@2x.png",
+   33:                                               "icons/icon.icns",
+   34:                                               "icons/icon.ico"
+   35:                                           ],
+   36:                                  "identifier":  "com.timanou.nikolai",
+   37:                                  "longDescription":  "",
+   38:                                  "macOS":  {
+   39:                                                "entitlements":  null,
+   40:                                                "exceptionDomain":  "",
+   41:                                                "frameworks":  [
+   42: 
+   43:                                                               ],
+   44:                                                "providerShortName":  null,
+   45:                                                "signingIdentity":  null
+   46:                                            },
+   47:                                  "resources":  [
+   48: 
+   49:                                                ],
+   50:                                  "shortDescription":  "",
+   51:                                  "targets":  "all",
+   52:                                  "windows":  {
+   53:                                                  "certificateThumbprint":  null,
+   54:                                                  "digestAlgorithm":  "sha256",
+   55:                                                  "timestampUrl":  ""
+   56:                                              }
+   57:                              },
+   58:                   "security":  {
+   59:                                    "csp":  null
+   60:                                },
+   61:                   "updater":  {
+   62:                                   "active":  false
+   63:                               },
+   64:                   "windows":  [
+   65:                                   {
+   66:                                       "fullscreen":  false,
+   67:                                       "height":  600,
+   68:                                       "resizable":  true,
+   69:                                       "title":  "Nikolai",
+   70:                                       "width":  800
+   71:                                   }
+   72:                               ]
+   73:               }
+   74: }

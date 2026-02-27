@@ -1,0 +1,14 @@
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:55: async function runTool(opts: {
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:90: executeTool?: (name: string, args: any) => Promise<any>;
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:96: if (!opts.executeTool) {
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:97: opts.onToken(`\n\n[agent] Approval executor missing (executeTool). Tool calls are blocked.\n`);
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:145: const r = await runTool({
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:148: exec: opts.executeTool,
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:59: export async function mcpCallTool(name: string, args: any): Promise<any> {
+C:\Dev\Nikolai-desktop\src\App.tsx:23: import { mcpCallTool, mcpListTools } from "./lib/mcp";
+C:\Dev\Nikolai-desktop\src\App.tsx:258: const executeToolWithApproval = async (name: string, args: any) => {
+C:\Dev\Nikolai-desktop\src\App.tsx:264: return await withTimeout(mcpCallTool(name, normalizedArgs), TOOL_TIMEOUT_MS, `Tool timeout: ${name}`);
+C:\Dev\Nikolai-desktop\src\App.tsx:274: return await withTimeout(mcpCallTool(name, normalizedArgs), TOOL_TIMEOUT_MS, `Tool timeout: ${name}`);
+C:\Dev\Nikolai-desktop\src\App.tsx:467: executeTool: executeToolWithApproval,
+C:\Dev\Nikolai-desktop\src\App.tsx:551: const out = await mcpCallTool(toolCmd.name, toolCmd.args || {});
+C:\Dev\Nikolai-desktop\src\App.tsx:623: executeTool: executeToolWithApproval,

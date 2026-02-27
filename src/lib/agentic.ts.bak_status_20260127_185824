@@ -1,0 +1,221 @@
+﻿import { ollamaChat, type OllamaMsg } from "./ollamaChat";
+import { ollamaStreamChat } from "./ollamaStream";
+import { mcpCallTool, mcpListTools, type McpTool } from "./mcp";
+import { appendToolLog } from "./toolLog";
+import { formatToolResult } from "./toolResult";
+
+type Plan =
+  | { action: "tool"; name: string; args: any }
+  | { action: "final"; content: string };
+
+function stripCodeFences(s: string) {
+  return (s || "").trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+}
+
+function parsePlan(raw: string): Plan | null {
+  const cleaned = stripCodeFences(raw);
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  try {
+    const obj: any = JSON.parse(cleaned.slice(start, end + 1));
+    if (obj?.action === "tool" && typeof obj?.name === "string") return { action: "tool", name: obj.name, args: obj.args ?? {} };
+    if (obj?.action === "final" && typeof obj?.content === "string") return { action: "final", content: obj.content };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function lastUserText(msgs: OllamaMsg[]) {
+  for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].role === "user") return msgs[i].content || "";
+  return "";
+}
+
+function normalizePath(p: string) {
+  return (p || "").replace(/\\/g, "/");
+}
+
+function extractPath(text: string): string | null {
+  const t = text || "";
+  const m = t.match(/([A-Za-z]:[\\/][^\s"'`]+)/);
+  if (m?.[1]) return normalizePath(m[1]);
+  return null;
+}
+
+function isAllowedAgenticTool(name: string): boolean {
+  if (name.startsWith("fs.")) return true;
+  if (name.startsWith("project-brain.")) return true;
+
+  const pfx = "doc-suite.doc_suite.";
+  if (name.startsWith(pfx)) {
+    const rest = name.slice(pfx.length);
+    if (rest.startsWith("export_")) return true;
+    if (rest.startsWith("render_")) return true;
+    if (rest.startsWith("security_")) return true;
+    if (rest === "suite_self_test") return true;
+    if (rest === "email_draft_eml") return true;
+    if (rest === "calendar_invite_ics") return true;
+    return false; // block online by default
+  }
+  return false;
+}
+
+function toolCatalog(tools: McpTool[]): string {
+  const safe = (tools || []).filter((t) => isAllowedAgenticTool(t.name));
+  return safe.map((t) => `- ${t.name}${t.description ? ` — ${t.description}` : ""}`).join("\n");
+}
+
+async function runTool(convo: OllamaMsg[], toolName: string, args: any, onToken?: (t: string) => void, exec?: (name: string, args: any) => Promise<any>) {
+  onToken?.(`\n\n🔧 Running: ${toolName}\n`);try {
+    const out = exec ? await exec(toolName, args ?? {}) : await mcpCallTool(toolName, args ?? {});
+    appendToolLog({ id: `tl-${Date.now()}`, ts: Date.now(), tool: toolName, args: args ?? {}, ok: true, result: out });
+
+    const formatted = formatToolResult(toolName, out);
+    if (formatted.isError) {
+      convo.push({ role: "assistant", content: `[tool result error] ${toolName}\n${formatted.text}` });
+      onToken?.(`❌ Error: ${toolName}\n`);return false;
+    }
+
+    convo.push({ role: "assistant", content: `[tool result] ${toolName}\n${formatted.text}` });
+    onToken?.(`✅ Done: ${toolName}\n`);return true;
+  } catch (e: any) {
+    appendToolLog({ id: `tl-${Date.now()}`, ts: Date.now(), tool: toolName, args: args ?? {}, ok: false, error: e?.message || String(e) });
+    convo.push({ role: "assistant", content: `[tool error] ${toolName}\n${e?.message || String(e)}` });
+    onToken?.(`❌ Error: ${toolName}\n`);return false;
+  }
+}
+
+export async function agenticStreamChat(opts: {
+  baseUrl: string;
+  model: string;
+  messages: OllamaMsg[];
+  signal: AbortSignal;
+  onToken: (t: string) => void;
+  onStatus?: (s: string) => void;
+  maxSteps?: number;
+  executeTool?: (name: string, args: any) => Promise<any>;
+}): Promise<void> {
+  const maxSteps = opts.maxSteps ?? 3;
+
+  // HARD STOP: if tools aren't available, do not guess.
+  let tools: McpTool[] = [];
+  try {
+    tools = await mcpListTools();
+  } catch (e: any) {
+    opts.onToken(`\n\n[agent] MCP tools not available (${e?.message || String(e)}). Tools tab → Connect → List tools.\n`);
+    return;
+  }
+
+  const catalog = toolCatalog(tools);
+  if (!catalog) {
+    opts.onToken(`\n\n[agent] No allowed tools available. Connect MCP and run /tools.\n`);
+    return;
+  }
+
+  let convo: OllamaMsg[] = [...opts.messages];
+
+
+
+  // Agentic MUST go through approval executor (no silent tool calls)
+  if (!opts.executeTool) {
+    opts.onToken(`\n\n[agent] Approval executor missing (executeTool). Tool calls are blocked.\n`);
+    return;
+  }
+  // HARD REQUIREMENT: prevent silent tool calls.
+  if (!opts.executeTool) {
+    opts.onToken(`\n\n[agent] Agentic requires tool approval executor (executeTool). Please restart app or update App.tsx wiring.\n`);
+    return;
+  }
+  const user = lastUserText(convo);
+  const u = user.toLowerCase();
+  const askedList = u.includes("list") && (u.includes("file") || u.includes("folder") || u.includes("directory") || u.includes("contents"));
+  const askedMcpWired = u.includes("mcp") && (u.includes("wired") || u.includes("wire") || u.includes("where"));
+
+  // Force tools for filesystem questions (prevents hallucination)
+  let didTool = false;
+
+  const pathFromUser = extractPath(user);
+  if (askedList && pathFromUser) {
+    didTool = (await runTool(convo, "fs.list_directory", { path: pathFromUser }, opts.onToken, opts.executeTool)) || didTool;
+  }
+
+  if (askedMcpWired) {
+    // Derive repo root
+    const base = normalizePath(pathFromUser || "C:/Dev/Nikolai-desktop").replace(/\/+$/, "");
+    const root = base.includes("/src-tauri") ? base.split("/src-tauri")[0] : base;
+
+    didTool = (await runTool(convo, "fs.read_file", { path: `${root}/src-tauri/src/main.rs` }, opts.onToken, opts.executeTool)) || didTool;
+    didTool = (await runTool(convo, "fs.read_file", { path: `${root}/src-tauri/src/mcp.rs` }, opts.onToken, opts.executeTool)) || didTool;
+
+    // Optional extra wiring context (frontend + bridge)
+    didTool = (await runTool(convo, "fs.read_file", { path: `${root}/src/lib/mcp.ts` }, opts.onToken, opts.executeTool)) || didTool;
+  }
+
+  // Planner loop (allowed to add extra tools), but NOT allowed to “final” without tools when tools are required
+  for (let step = 1; step <= maxSteps; step++) {
+    if (opts.signal.aborted) throw Object.assign(new Error("Aborted"), { name: "AbortError" });
+    opts.onStatus?.(`[agent] thinking ${step}/${maxSteps}…`);
+
+    const plannerSystem: OllamaMsg = {
+      role: "system",
+      content:
+        `You are a tool planner. ONLY output one JSON object.\n` +
+        `Tool: {"action":"tool","name":"<tool>","args":{...}}\n` +
+        `Final: {"action":"final","content":"..."}\n\n` +
+        `Allowed tools:\n${catalog}\n\n` +
+        `Rules:\n- Never invent file lists or code. If uncertain, use fs.* tools.\n- Avoid node_modules.\n`,
+    };
+
+    const planText = await ollamaChat({
+      baseUrl: opts.baseUrl,
+      model: opts.model,
+      messages: [plannerSystem, ...convo],
+      signal: opts.signal,
+    });
+
+    const plan = parsePlan(planText);
+
+    // If user asked for filesystem info and no tool ran, do NOT accept final.
+    if ((!plan || plan.action === "final") && (askedList || askedMcpWired) && !didTool) {
+      opts.onToken(`\n\n[agent] Need tool results before answering, but no tool call succeeded. Check MCP connection.\n`);
+      return;
+    }
+
+    if (!plan || plan.action === "final") break;
+
+    if (!isAllowedAgenticTool(plan.name)) {
+      convo.push({ role: "assistant", content: `[tool blocked] ${plan.name}` });
+      continue;
+    }
+
+    const ok = await runTool(convo, plan.name, plan.args ?? {}, opts.onToken, opts.executeTool);
+    didTool = didTool || ok;
+  }
+
+  opts.onStatus?.("");
+
+  const finalSystem: OllamaMsg = {
+    role: "system",
+    content:
+      `Answer using the tool results included in the chat.\n` +
+      `Do NOT invent filesystem results. Cite file paths.\n` +
+      `Do NOT output JSON tool directives.\n`,
+  };
+
+  await ollamaStreamChat({
+    baseUrl: opts.baseUrl,
+    model: opts.model,
+    messages: [finalSystem, ...convo],
+    signal: opts.signal,
+    onToken: opts.onToken,
+  });
+}
+
+
+
+
+
+
+
+

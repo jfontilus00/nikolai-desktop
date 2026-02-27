@@ -1,0 +1,230 @@
+import React, { useEffect, useMemo, useState } from "react";
+import { mcpCallTool, mcpConnect, mcpDisconnect, mcpListTools, mcpStatus, type McpTool } from "../lib/mcp";
+import { appendToolLog, loadToolLog, type ToolLogItem } from "../lib/toolLog";
+
+type Props = {
+  onInsertToComposer?: (text: string) => void;
+};
+
+const CFG_KEY = "nikolai.mcp.stdio.v1";
+
+type StoredCfg = {
+  command: string;
+  args: string;
+  cwd: string;
+};
+
+function loadCfg(): StoredCfg {
+  try {
+    const raw = localStorage.getItem(CFG_KEY);
+    if (!raw) {
+      return { command: "", args: "", cwd: "" };
+    }
+    return JSON.parse(raw);
+  } catch {
+    return { command: "", args: "", cwd: "" };
+  }
+}
+function saveCfg(c: StoredCfg) {
+  localStorage.setItem(CFG_KEY, JSON.stringify(c));
+}
+
+export default function ToolsPanel({ onInsertToComposer }: Props) {
+  const [status, setStatus] = useState<{ connected: boolean; command?: string; cwd?: string | null }>({ connected: false });
+  const [cfg, setCfg] = useState<StoredCfg>(() => loadCfg());
+  const [tools, setTools] = useState<McpTool[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [log, setLog] = useState<ToolLogItem[]>(() => loadToolLog());
+
+  const argsArray = useMemo(() => {
+    const s = (cfg.args || "").trim();
+    if (!s) return [];
+    // simple split, supports quoted args loosely
+    return s.split(" ").map((x) => x.trim()).filter(Boolean);
+  }, [cfg.args]);
+
+  useEffect(() => {
+    mcpStatus().then(setStatus).catch(() => setStatus({ connected: false }));
+  }, []);
+
+  const refreshLog = () => setLog(loadToolLog());
+
+  const connect = async () => {
+    setBusy(true);
+    try {
+      saveCfg(cfg);
+      const st = await mcpConnect({
+        command: cfg.command.trim(),
+        args: argsArray,
+        cwd: cfg.cwd.trim() ? cfg.cwd.trim() : null,
+      });
+      setStatus(st);
+    } catch (e: any) {
+      alert(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const disconnect = async () => {
+    setBusy(true);
+    try {
+      const st = await mcpDisconnect();
+      setStatus(st);
+      setTools([]);
+    } catch (e: any) {
+      alert(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const listTools = async () => {
+    setBusy(true);
+    try {
+      const t = await mcpListTools();
+      setTools(t || []);
+    } catch (e: any) {
+      alert(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const quickCall = async (name: string) => {
+    // Just a helper for testing from UI
+    setBusy(true);
+    try {
+      const args = {};
+      const out = await mcpCallTool(name, args);
+      appendToolLog({ id: `tl-${Date.now()}`, ts: Date.now(), tool: name, args, ok: true, result: out });
+      refreshLog();
+      alert("Tool call OK (logged).");
+    } catch (e: any) {
+      appendToolLog({ id: `tl-${Date.now()}`, ts: Date.now(), tool: name, args: {}, ok: false, error: e?.message || String(e) });
+      refreshLog();
+      alert(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="p-3 space-y-3 text-sm">
+      <div className="flex items-center justify-between">
+        <div className="font-semibold">MCP Tools</div>
+        <div className={`text-xs ${status.connected ? "text-green-300" : "text-gray-400"}`}>
+          {status.connected ? "connected" : "disconnected"}
+        </div>
+      </div>
+
+      <div className="space-y-2 border border-white/10 rounded-lg p-3 bg-white/5">
+        <div className="text-xs opacity-70">STDIO server (Claude-style)</div>
+
+        <label className="block text-xs opacity-70">Command</label>
+        <input
+          className="w-full rounded-md bg-black/30 border border-white/10 px-2 py-1 outline-none focus:border-white/30"
+          value={cfg.command}
+          onChange={(e) => setCfg({ ...cfg, command: e.target.value })}
+          placeholder="e.g. node C:\path\to\mcp-server.js"
+        />
+
+        <label className="block text-xs opacity-70">Args (space-separated)</label>
+        <input
+          className="w-full rounded-md bg-black/30 border border-white/10 px-2 py-1 outline-none focus:border-white/30"
+          value={cfg.args}
+          onChange={(e) => setCfg({ ...cfg, args: e.target.value })}
+          placeholder='e.g. --stdio --port 3001'
+        />
+
+        <label className="block text-xs opacity-70">CWD (optional)</label>
+        <input
+          className="w-full rounded-md bg-black/30 border border-white/10 px-2 py-1 outline-none focus:border-white/30"
+          value={cfg.cwd}
+          onChange={(e) => setCfg({ ...cfg, cwd: e.target.value })}
+          placeholder="e.g. C:\Dev\mcp-server"
+        />
+
+        <div className="flex gap-2 pt-2">
+          {!status.connected ? (
+            <button
+              onClick={connect}
+              disabled={busy || !cfg.command.trim()}
+              className="px-3 py-2 rounded-md bg-blue-600 hover:bg-blue-500 disabled:opacity-50"
+            >
+              Connect
+            </button>
+          ) : (
+            <button onClick={disconnect} disabled={busy} className="px-3 py-2 rounded-md bg-amber-600 hover:bg-amber-500">
+              Disconnect
+            </button>
+          )}
+
+          <button onClick={listTools} disabled={busy || !status.connected} className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 disabled:opacity-50">
+            List tools
+          </button>
+
+          <button onClick={refreshLog} className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15">
+            Refresh log
+          </button>
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <div className="font-semibold text-xs opacity-70">Tools</div>
+        <div className="border border-white/10 rounded-lg overflow-hidden">
+          {tools.length === 0 ? (
+            <div className="p-3 text-xs opacity-60">No tools loaded yet.</div>
+          ) : (
+            tools.map((t) => (
+              <div key={t.name} className="px-3 py-2 border-b border-white/10 flex items-center justify-between">
+                <div className="min-w-0">
+                  <div className="font-medium truncate">{t.name}</div>
+                  {t.description ? <div className="text-xs opacity-60 truncate">{t.description}</div> : null}
+                </div>
+
+                <div className="flex gap-2">
+                  <button
+                    className="px-2 py-1 text-xs rounded bg-white/10 hover:bg-white/20"
+                    onClick={() => onInsertToComposer?.(`/tool ${t.name} {}`)}
+                  >
+                    Insert
+                  </button>
+                  <button
+                    className="px-2 py-1 text-xs rounded bg-white/10 hover:bg-white/20"
+                    onClick={() => quickCall(t.name)}
+                  >
+                    Test
+                  </button>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <div className="font-semibold text-xs opacity-70">Tool log</div>
+        <div className="border border-white/10 rounded-lg overflow-hidden max-h-52 overflow-auto">
+          {log.length === 0 ? (
+            <div className="p-3 text-xs opacity-60">No tool calls yet.</div>
+          ) : (
+            log.map((x) => (
+              <div key={x.id} className="px-3 py-2 border-b border-white/10">
+                <div className="flex items-center justify-between">
+                  <div className="font-medium">{x.tool}</div>
+                  <div className={`text-xs ${x.ok ? "text-green-300" : "text-red-300"}`}>{x.ok ? "ok" : "fail"}</div>
+                </div>
+                <div className="text-xs opacity-60">{new Date(x.ts).toLocaleTimeString()}</div>
+                <details className="mt-1 text-xs">
+                  <summary className="cursor-pointer opacity-80">details</summary>
+                  <pre className="mt-2 whitespace-pre-wrap break-words opacity-90">{JSON.stringify({ args: x.args, result: x.result, error: x.error }, null, 2)}</pre>
+                </details>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

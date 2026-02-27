@@ -1,0 +1,405 @@
+﻿import React, { useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import type { ChatThread, Message } from "../types";
+import { mcpConnect, mcpStatus, mcpListTools } from "../lib/mcp";
+
+type Props = {
+  chat: ChatThread | null;
+  onSend: (text: string) => void;
+  isStreaming: boolean;
+  onStop: () => void;
+  onRegenerate?: () => void;
+  canRegenerate?: boolean;
+  onClearStatus?: () => void;
+};
+
+function sanitizeLegacyStatusLines(s: string) {
+  if (!s) return s;
+  const lines = s.split(/\r?\n/);
+  const filtered = lines.filter((ln) => {
+    const t = ln.trim();
+    if (!t) return true;
+    if (t.startsWith("Running:")) return false;
+    if (t.startsWith("Done:")) return false;
+    if (t.startsWith("✅ Done:")) return false;
+    if (t.startsWith("🛠 Running:")) return false;
+    return true;
+  });
+  return filtered.join("\n").trim();
+}
+
+/**
+ * Identity guard (DISPLAY ONLY):
+ * If a model claims it is "Kimi/Claude/ChatGPT/..." we rewrite that line for UI.
+ * Does not modify stored chat history.
+ */
+function guardIdentityDisplay(text: string) {
+  const s = (text || "").trimStart();
+  const head = s.slice(0, 220).toLowerCase();
+
+  const bad =
+    head.startsWith("yes, i am kimi") ||
+    head.startsWith("i am kimi") ||
+    head.startsWith("i'm kimi") ||
+    head.startsWith("yes, i'm kimi") ||
+    head.startsWith("yes, i am claude") ||
+    head.startsWith("i am claude") ||
+    head.startsWith("i'm claude") ||
+    head.startsWith("yes, i am chatgpt") ||
+    head.startsWith("i am chatgpt") ||
+    head.startsWith("i'm chatgpt") ||
+    head.includes("created by moonshot") ||
+    head.includes("moonshot ai");
+
+  if (!bad) return text;
+
+  // Replace only the first paragraph/line
+  const lines = s.split(/\r?\n/);
+  lines[0] = "I’m Nikolai Desktop (local). How can I help?";
+  return lines.join("\n");
+}
+
+async function copyToClipboard(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function downloadMarkdown(filename: string, content: string) {
+  const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function Avatar({ kind }: { kind: "user" | "assistant" }) {
+  const label = kind === "assistant" ? "N" : "U";
+  const cls =
+    kind === "assistant"
+      ? "bg-white/10 border border-white/15 text-white/90"
+      : "bg-blue-600/30 border border-blue-500/30 text-blue-100";
+  return (
+    <div className={`h-7 w-7 rounded-full flex items-center justify-center text-xs font-semibold ${cls}`}>
+      {label}
+    </div>
+  );
+}
+
+function CodeBlock({ code }: { code: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="relative my-2">
+      <button
+        className="absolute top-2 right-2 text-[11px] px-2 py-1 rounded bg-white/10 hover:bg-white/15 border border-white/10"
+        onClick={async () => {
+          const ok = await copyToClipboard(code);
+          if (ok) {
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1200);
+          }
+        }}
+      >
+        {copied ? "Copied" : "Copy"}
+      </button>
+      <pre className="text-xs whitespace-pre overflow-x-auto rounded-lg bg-black/40 border border-white/10 p-3">
+        <code>{code}</code>
+      </pre>
+    </div>
+  );
+}
+
+function Md({ text }: { text: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        h1: ({ children }) => <h1 className="text-lg font-semibold mt-2 mb-2">{children}</h1>,
+        h2: ({ children }) => <h2 className="text-base font-semibold mt-3 mb-2">{children}</h2>,
+        h3: ({ children }) => <h3 className="text-sm font-semibold mt-3 mb-1">{children}</h3>,
+        p: ({ children }) => <p className="leading-relaxed my-2">{children}</p>,
+        ul: ({ children }) => <ul className="list-disc pl-5 my-2 space-y-1">{children}</ul>,
+        ol: ({ children }) => <ol className="list-decimal pl-5 my-2 space-y-1">{children}</ol>,
+        li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+        blockquote: ({ children }) => (
+          <blockquote className="border-l-2 border-white/20 pl-3 my-2 opacity-90">{children}</blockquote>
+        ),
+        hr: () => <hr className="border-white/10 my-3" />,
+        a: ({ href, children }) => (
+          <a href={href} target="_blank" rel="noreferrer" className="text-blue-300 hover:text-blue-200 underline underline-offset-2">
+            {children}
+          </a>
+        ),
+        code: ({ children, className }) => {
+          const raw = String(children ?? "");
+          const code = raw.replace(/\n$/, "");
+          const isBlock = (className || "").includes("language-") || raw.includes("\n");
+          if (isBlock) return <CodeBlock code={code} />;
+          return <code className="text-xs rounded bg-black/40 border border-white/10 px-1 py-0.5">{children}</code>;
+        },
+      }}
+    >
+      {text}
+    </ReactMarkdown>
+  );
+}
+
+export default function ChatCenter({ chat, onSend, isStreaming, onStop, onRegenerate, canRegenerate, onClearStatus }: Props) {
+  const [text, setText] = useState("");
+  const endRef = useRef<HTMLDivElement | null>(null);
+
+  // MCP status chips
+  const [mcpConnected, setMcpConnected] = useState(false);
+  const [toolCount, setToolCount] = useState<number | null>(null);
+  const [mcpReconnectBusy, setMcpReconnectBusy] = useState(false);
+  const [mcpReconnectErr, setMcpReconnectErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chat?.messages.length]);
+
+  async function pollMcp() {
+    try {
+      const st = await mcpStatus();
+      const connected = !!st?.connected;
+      setMcpConnected(connected);
+
+      if (connected) {
+        try {
+          const tools = await mcpListTools();
+          setToolCount(Array.isArray(tools) ? tools.length : 0);
+        } catch {
+          setToolCount(null);
+        }
+      } else {
+        setToolCount(null);
+      }
+    } catch {
+      setMcpConnected(false);
+      setToolCount(null);
+    }
+  }
+
+  useEffect(() => {
+    pollMcp();
+    const id = window.setInterval(pollMcp, 5000);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const exportChat = () => {
+    if (!chat) return;
+    const safeTitle = (chat.title || "chat").replace(/[\\\/:*?"<>|]+/g, "_").trim() || "chat";
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const filename = `${safeTitle}_${ts}.md`;
+
+    const md = [
+      `# ${chat.title || "Chat"}`,
+      ``,
+      ...chat.messages.map((m) => {
+        const role = m.role === "user" ? "User" : m.role === "assistant" ? "Assistant" : m.role;
+        const body = String(m.content || "");
+        return `## ${role}\n\n${body}\n`;
+      }),
+    ].join("\n");
+
+    downloadMarkdown(filename, md);
+  };
+
+  if (!chat) {
+    return (
+      <div className="h-full flex items-center justify-center">
+        <div className="text-center space-y-2">
+          <div className="text-xl font-bold">Nikolai Desktop</div>
+          <div className="text-sm opacity-70">Create a chat from the left panel.</div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="h-full flex flex-col">
+      <div className="h-12 flex items-center justify-between px-4 border-b border-white/10">
+        <div className="font-semibold">{chat.title}</div>
+
+        <div className="text-xs opacity-70 flex items-center gap-2">
+          {isStreaming ? <span className="text-green-300">• streaming</span> : <span>idle</span>}
+          <span>Messages: {chat.messages.length}</span>
+
+          <span className={`px-2 py-0.5 rounded border border-white/10 ${mcpConnected ? "bg-white/10" : "bg-transparent"}`}>
+            MCP: {mcpConnected ? "connected" : "disconnected"}
+          </span>
+          <span className="px-2 py-0.5 rounded border border-white/10 bg-white/5">
+            Tools: {toolCount === null ? "—" : toolCount}
+          </span>
+
+          <button
+            className="ml-2 px-2 py-1 rounded bg-white/10 hover:bg-white/15 border border-white/10"
+            onClick={exportChat}
+            title="Export chat as Markdown"
+          >
+            Export .md
+          </button>
+
+          <button
+            className="px-2 py-1 rounded bg-white/10 hover:bg-white/15 border border-white/10"
+            onClick={() => onClearStatus?.()}
+            disabled={!onClearStatus}
+            title="Clear stuck status"
+          >
+            Clear status
+          </button>
+        </div>
+      </div>
+
+      <div className="flex-1 overflow-auto p-4 space-y-4">
+        {chat.messages.map((m, idx) => (
+          <MessageBubble
+            key={m.id}
+            m={m}
+            isLast={idx === chat.messages.length - 1}
+            canRegenerate={!!canRegenerate}
+            onRegenerate={onRegenerate}
+          />
+        ))}
+        <div ref={endRef} />
+      </div>
+
+      <div className="border-t border-white/10 p-3">
+        <div className="flex gap-2">
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            rows={2}
+            placeholder="Type a message…"
+            className="flex-1 resize-none rounded-md bg-white/5 border border-white/10 px-3 py-2 text-sm outline-none focus:border-white/30"
+            onKeyDown={(e) => {
+              if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+                e.preventDefault();
+                const t = text.trim();
+                if (!t) return;
+                onSend(t);
+                setText("");
+              }
+            }}
+            disabled={isStreaming}
+          />
+
+          {!isStreaming ? (
+            <button
+              className="rounded-md bg-blue-600 hover:bg-blue-500 px-4 py-2 text-sm font-semibold disabled:opacity-50"
+              onClick={() => {
+                const t = text.trim();
+                if (!t) return;
+                onSend(t);
+                setText("");
+              }}
+              disabled={!text.trim()}
+            >
+              Send
+            </button>
+          ) : (
+            <button className="rounded-md bg-amber-600 hover:bg-amber-500 px-4 py-2 text-sm font-semibold" onClick={onStop}>
+              Stop
+            </button>
+          )}
+        </div>
+
+        <div className="mt-2 text-xs opacity-60">Tip: Ctrl+Enter to send</div>
+      </div>
+    </div>
+  );
+}
+
+function MessageBubble({
+  m,
+  isLast,
+  canRegenerate,
+  onRegenerate,
+}: {
+  m: Message;
+  isLast: boolean;
+  canRegenerate: boolean;
+  onRegenerate?: () => void;
+}) {
+  const isUser = m.role === "user";
+  const isStatus = !isUser && typeof m.content === "string" && m.content.startsWith("__STATUS__:");
+  const statusText = isStatus ? m.content.replace("__STATUS__:", "").trim() : "";
+
+  let content = sanitizeLegacyStatusLines(String(m.content || ""));
+  if (!isUser && !isStatus) content = guardIdentityDisplay(content);
+
+  return (
+    <div className={`flex gap-3 ${isUser ? "justify-end" : "justify-start"}`}>
+      {!isUser ? <Avatar kind="assistant" /> : null}
+
+      <div
+        className={`group max-w-[72%] rounded-2xl px-4 py-3 border relative ${
+          isUser ? "bg-blue-600/20 border-blue-500/30" : "bg-white/5 border-white/10"
+        }`}
+      >
+        {!isStatus ? (
+          <div className="absolute top-2 right-2 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+            <button
+              className="text-[11px] px-2 py-1 rounded bg-white/10 hover:bg-white/15 border border-white/10"
+              onClick={async () => {
+                await copyToClipboard(content);
+              }}
+              title="Copy message"
+            >
+              Copy
+            </button>
+
+            {!isUser && isLast && canRegenerate && onRegenerate ? (
+              <button
+                className="text-[11px] px-2 py-1 rounded bg-white/10 hover:bg-white/15 border border-white/10"
+                onClick={onRegenerate}
+                title="Regenerate last answer"
+              >
+                Regen
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+
+        {isStatus ? (
+          <div className="inline-flex items-center gap-2 text-xs opacity-85">
+            <span className="h-3 w-3 rounded-full border border-white/30 border-t-white/80 animate-spin" />
+            <span>{statusText || "Working..."}</span>
+          </div>
+        ) : (
+          <>
+            <div className="text-sm">
+              {isUser ? <div className="whitespace-pre-wrap leading-relaxed">{content}</div> : <Md text={content} />}
+            </div>
+            <div className="mt-2 text-[10px] opacity-60">{new Date(m.ts).toLocaleTimeString()}</div>
+          </>
+        )}
+      </div>
+
+      {isUser ? <Avatar kind="user" /> : null}
+    </div>
+  );
+}
+
+

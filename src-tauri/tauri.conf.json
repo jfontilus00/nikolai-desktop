@@ -1,0 +1,77 @@
+{
+    "$schema": "../node_modules/@tauri-apps/cli/schema.json",
+    "build": {
+        "beforeBuildCommand": "npm run build",
+        "beforeDevCommand": "npm run dev",
+        "devPath": "http://127.0.0.1:5180",
+        "distDir": "../dist"
+    },
+    "package": {
+        "productName": "Atelier NikolAi",
+        "version": "0.3.0"
+    },
+    "tauri": {
+        "allowlist": {
+            "all": false,
+            "dialog": {
+                "all": false,
+                "open": true
+            }
+        },
+        "bundle": {
+            "active": true,
+            "category": "DeveloperTool",
+            "copyright": "\u00a9 2025 Atelier NikolAi. All rights reserved.",
+            "deb": {
+                "depends": []
+            },
+            "externalBin": [],
+            "icon": [
+                "icons/32x32.png",
+                "icons/128x128.png",
+                "icons/128x128@2x.png",
+                "icons/icon.icns",
+                "icons/icon.ico"
+            ],
+            "identifier": "com.timanou.nikolai",
+            "longDescription": "Atelier NikolAi Desktop \u2014 a local-first AI workspace powered by Ollama.",
+            "macOS": {
+                "entitlements": null,
+                "exceptionDomain": "",
+                "frameworks": [],
+                "providerShortName": null,
+                "signingIdentity": null
+            },
+            "resources": [],
+            "shortDescription": "Local AI atelier by Atelier NikolAi",
+            "targets": "all",
+            "windows": {
+                "certificateThumbprint": null,
+                "digestAlgorithm": "sha256",
+                "timestampUrl": "",
+                "wix": {
+                    "language": "en-US",
+                    "template": null
+                }
+            },
+            "publisher": "Atelier NikolAi"
+        },
+        "security": {
+            "csp": null
+        },
+        "updater": {
+            "active": false
+        },
+        "windows": [
+            {
+                "fullscreen": false,
+                "height": 900,
+                "resizable": true,
+                "title": "Atelier NikolAi Desktop",
+                "width": 1400,
+                "minWidth": 900,
+                "minHeight": 600
+            }
+        ]
+    }
+}

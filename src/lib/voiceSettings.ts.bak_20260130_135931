@@ -1,0 +1,42 @@
+const KEY = "nikolai.voice.v1";
+
+export type VoiceSettings = {
+  sttBaseUrl: string;
+  sttPath: string;
+  sttLanguage: string;
+  sttTask: string;
+  forceWav: boolean;
+
+  ttsBaseUrl: string;
+  ttsPath: string;
+  ttsSpeed: number;
+};
+
+export function defaultVoiceSettings(): VoiceSettings {
+  return {
+    sttBaseUrl: "http://127.0.0.1:9000",
+    sttPath: "/asr",
+    sttLanguage: "en",
+    sttTask: "transcribe",
+    forceWav: true,
+
+    ttsBaseUrl: "http://127.0.0.1:9860",
+    ttsPath: "/tts",
+    ttsSpeed: 1.0,
+  };
+}
+
+export function loadVoiceSettings(): VoiceSettings {
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (!raw) return defaultVoiceSettings();
+    const v = JSON.parse(raw);
+    return { ...defaultVoiceSettings(), ...v };
+  } catch {
+    return defaultVoiceSettings();
+  }
+}
+
+export function saveVoiceSettings(s: VoiceSettings) {
+  localStorage.setItem(KEY, JSON.stringify(s));
+}

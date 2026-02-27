@@ -1,0 +1,4 @@
+C:\Dev\Nikolai-desktop\src\components\ErrorBoundary.tsx:75: Tip: If this happens often, it usually means a corrupted chat/tool log entry or a bad patch. Reset fixes it fast.
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:467: onClick={() => onInsertToComposer?.(`/tool ${tool.name} {}`)}
+C:\Dev\Nikolai-desktop\src\lib\toolCmd.ts:31: 'Invalid JSON args. Use: /tool name {"x":1}\nTip (Windows paths): use forward slashes (C:/Dev/...) or escape backslashes (C:\\\\Dev\\\\...).',
+C:\Dev\Nikolai-desktop\src\lib\toolCmd.ts:37: if (!t.toLowerCase().startsWith("/tool ")) return null;

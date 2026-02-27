@@ -1,0 +1,26 @@
+export type Role = "user" | "assistant" | "system";
+
+export type Message = { id: string; role: Role; content: string; ts: number };
+
+export type ChatThread = {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  messages: Message[];
+};
+
+export type LayoutState = {
+  leftWidth: number;
+  rightWidth: number;
+  leftCollapsed: boolean;
+  rightCollapsed: boolean;
+};
+
+export type ProviderKind = "ollama" | "openrouter" | "anthropic" | "qwen_desktop";
+
+export type ProviderConfig = {
+  kind: ProviderKind;
+  ollamaBaseUrl: string;
+  ollamaModel: string;
+};

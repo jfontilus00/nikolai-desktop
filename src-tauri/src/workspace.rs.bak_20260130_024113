@@ -1,0 +1,181 @@
+use once_cell::sync::OnceCell;
+use serde::Serialize;
+use serde_json::json;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static WORKSPACE_ROOT: OnceCell<PathBuf> = OnceCell::new();
+
+#[derive(Serialize)]
+pub struct WsEntry {
+  pub name: String,
+  pub rel: String,
+  pub is_dir: bool,
+  pub size: Option<u64>,
+}
+
+fn now_millis() -> u128 {
+  SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_millis()
+}
+
+fn sanitize_rel(rel: &str) -> Result<PathBuf, String> {
+  let r = rel.trim().replace('\\', "/");
+  if r.is_empty() {
+    return Ok(PathBuf::new());
+  }
+
+  let p = Path::new(&r);
+  for c in p.components() {
+    match c {
+      Component::ParentDir => return Err("Workspace: '..' not allowed".into()),
+      Component::RootDir => return Err("Workspace: absolute paths not allowed".into()),
+      Component::Prefix(_) => return Err("Workspace: absolute paths not allowed".into()),
+      _ => {}
+    }
+  }
+  Ok(p.to_path_buf())
+}
+
+fn root() -> Result<PathBuf, String> {
+  WORKSPACE_ROOT
+    .get()
+    .cloned()
+    .ok_or_else(|| "Workspace root not set. Choose a Workspace Root first.".to_string())
+}
+
+fn resolve(rel: &str) -> Result<PathBuf, String> {
+  let r = sanitize_rel(rel)?;
+  Ok(root()?.join(r))
+}
+
+fn rel_join(base: &str, name: &str) -> String {
+  let b = base.trim().replace('\\', "/").trim_matches('/').to_string();
+  let n = name.trim().replace('\\', "/");
+  if b.is_empty() { n } else { format!("{}/{}", b, n) }
+}
+
+#[tauri::command]
+pub fn ws_set_root(path: String) -> Result<String, String> {
+  let p = path.trim();
+  if p.is_empty() {
+    return Err("Workspace root is empty".into());
+  }
+  let canon = fs::canonicalize(p).map_err(|e| format!("Failed to set root: {}", e))?;
+  WORKSPACE_ROOT
+    .set(canon.clone())
+    .map_err(|_| "Workspace root already set (restart app to change)".to_string())?;
+  Ok(canon.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn ws_get_root() -> Option<String> {
+  WORKSPACE_ROOT.get().map(|p| p.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn ws_list_dir(rel: String, max_entries: Option<usize>) -> Result<Vec<WsEntry>, String> {
+  let maxn = max_entries.unwrap_or(2000);
+  let dir = resolve(&rel)?;
+  let mut out: Vec<WsEntry> = vec![];
+
+  let rd = fs::read_dir(&dir).map_err(|e| format!("List dir failed: {}", e))?;
+  for entry in rd.take(maxn) {
+    let entry = entry.map_err(|e| format!("List dir entry failed: {}", e))?;
+    let meta = entry.metadata().ok();
+    let name = entry.file_name().to_string_lossy().to_string();
+    let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+    let size = meta.as_ref().and_then(|m| if m.is_file() { Some(m.len()) } else { None });
+
+    out.push(WsEntry {
+      name: name.clone(),
+      rel: rel_join(&rel, &name),
+      is_dir,
+      size,
+    });
+  }
+
+  // sort: folders first then name
+  out.sort_by(|a, b| {
+    match (a.is_dir, b.is_dir) {
+      (true, false) => std::cmp::Ordering::Less,
+      (false, true) => std::cmp::Ordering::Greater,
+      _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    }
+  });
+
+  Ok(out)
+}
+
+#[tauri::command]
+pub fn ws_read_text(rel: String) -> Result<String, String> {
+  let p = resolve(&rel)?;
+  fs::read_to_string(&p).map_err(|e| format!("Read failed: {}", e))
+}
+
+fn ensure_parent(path: &Path) -> Result<(), String> {
+  if let Some(parent) = path.parent() {
+    fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {}", e))?;
+  }
+  Ok(())
+}
+
+fn backups_dir() -> Result<PathBuf, String> {
+  Ok(root()?.join(".nikolai_backups"))
+}
+
+fn write_manifest(event: serde_json::Value) -> Result<(), String> {
+  let dir = backups_dir()?;
+  fs::create_dir_all(&dir).map_err(|e| format!("mkdir backups failed: {}", e))?;
+  let manifest = dir.join("manifest.jsonl");
+  let line = format!("{}\n", event.to_string());
+  fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(&manifest)
+    .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()))
+    .map_err(|e| format!("manifest write failed: {}", e))?;
+  Ok(())
+}
+
+#[tauri::command]
+pub fn ws_write_text(rel: String, content: String, backup: Option<bool>) -> Result<(), String> {
+  let p = resolve(&rel)?;
+  let do_backup = backup.unwrap_or(true);
+
+  // backup original if exists
+  if do_backup && p.exists() && p.is_file() {
+    let original = fs::read_to_string(&p).unwrap_or_default();
+    let ts = now_millis();
+    let bdir = backups_dir()?;
+    let bpath = bdir.join(format!("{}.{}.bak", rel.trim().replace('\\', "/"), ts));
+    ensure_parent(&bpath)?;
+    fs::write(&bpath, original).map_err(|e| format!("backup write failed: {}", e))?;
+    write_manifest(json!({
+      "ts": ts,
+      "type": "backup",
+      "file": rel.trim().replace('\\', "/"),
+      "backup": bpath.to_string_lossy().to_string()
+    }))?;
+  }
+
+  ensure_parent(&p)?;
+  fs::write(&p, content).map_err(|e| format!("Write failed: {}", e))?;
+
+  write_manifest(json!({
+    "ts": now_millis(),
+    "type": "write",
+    "file": rel.trim().replace('\\', "/")
+  }))?;
+
+  Ok(())
+}
+
+#[tauri::command]
+pub fn ws_mkdir(rel_dir: String) -> Result<(), String> {
+  let p = resolve(&rel_dir)?;
+  fs::create_dir_all(&p).map_err(|e| format!("mkdir failed: {}", e))
+}

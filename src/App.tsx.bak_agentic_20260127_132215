@@ -1,0 +1,384 @@
+﻿import React, { useMemo, useRef, useState } from "react";
+import type { ChatThread, Message, ProviderConfig } from "./types";
+import { uid } from "./lib/id";
+import {
+  loadActiveChatId,
+  loadChats,
+  saveActiveChatId,
+  saveChats,
+  loadLayout,
+  loadProvider,
+  saveProvider,
+} from "./lib/storage";
+import ResizableShell from "./components/ResizableShell";
+import ChatHistory from "./components/ChatHistory";
+import ChatCenter from "./components/ChatCenter";
+import RightPanel from "./components/RightPanel";
+import { ollamaStreamChat } from "./lib/ollamaStream";
+import { parseToolCommand } from "./lib/toolCmd";
+import { mcpCallTool, mcpListTools } from "./lib/mcp";
+import { appendToolLog } from "./lib/toolLog";
+import { formatToolResult } from "./lib/toolResult";
+
+function newChat(): ChatThread {
+  const id = uid("chat");
+  const now = Date.now();
+  return { id, title: "New chat", createdAt: now, updatedAt: now, messages: [] };
+}
+
+export default function App() {
+  const [chats, setChats] = useState<ChatThread[]>(() => loadChats());
+  const [activeId, setActiveId] = useState<string | null>(() => loadActiveChatId());
+  const [leftCollapsed, setLeftCollapsed] = useState(() => loadLayout().leftCollapsed);
+  const [rightCollapsed, setRightCollapsed] = useState(() => loadLayout().rightCollapsed);
+
+  const [provider, setProviderState] = useState<ProviderConfig>(() => loadProvider());
+
+  const [isStreaming, setIsStreaming] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
+
+  // allows ToolsPanel to insert text into chat composer later (v2)
+  const composerInsertRef = useRef<(t: string) => void>(() => {});
+
+  const activeChat = useMemo(() => chats.find((c) => c.id === activeId) || null, [chats, activeId]);
+
+  const persist = (next: ChatThread[], nextActive?: string | null) => {
+    setChats(next);
+    saveChats(next);
+    if (typeof nextActive !== "undefined") {
+      setActiveId(nextActive);
+      saveActiveChatId(nextActive);
+    }
+  };
+
+  const setProvider = (p: ProviderConfig) => {
+    setProviderState(p);
+    saveProvider(p);
+  };
+
+  const createChat = () => {
+    const c = newChat();
+    const next = [c, ...chats];
+    persist(next, c.id);
+  };
+
+  const deleteChat = (id: string) => {
+    const next = chats.filter((c) => c.id !== id);
+    const nextActive = activeId === id ? (next[0]?.id ?? null) : activeId;
+    persist(next, nextActive);
+  };
+
+  const renameChat = (id: string, title: string) => {
+    const next = chats.map((c) => (c.id === id ? { ...c, title, updatedAt: Date.now() } : c));
+    persist(next);
+  };
+
+  const selectChat = (id: string) => {
+    setActiveId(id);
+    saveActiveChatId(id);
+  };
+
+  const stop = () => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setIsStreaming(false);
+  };
+
+  const send = async (text: string) => {
+    let chat = activeChat;
+    if (!chat) {
+      createChat();
+      return;
+    }
+    if (isStreaming) return;
+
+    const userMsg: Message = { id: uid("m"), role: "user", content: text, ts: Date.now() };
+    const assistantMsgId = uid("m");
+    const assistantMsg: Message = { id: assistantMsgId, role: "assistant", content: "", ts: Date.now() + 1 };
+
+    // push user + empty assistant
+    const updatedChats = chats.map((c) =>
+      c.id === chat!.id ? { ...c, updatedAt: Date.now(), messages: [...c.messages, userMsg, assistantMsg] } : c
+    );
+    persist(updatedChats);
+
+    // TOOL PATH
+    const trimmed = text.trim();
+    if (trimmed.toLowerCase() === "/tools") {
+      try {
+        const tools = await mcpListTools();
+
+        appendToolLog({
+          id: `tl-${Date.now()}`,
+          ts: Date.now(),
+          tool: "mcp_list_tools",
+          args: {},
+          ok: true,
+          result: tools,
+        });
+
+        const lines = (tools || []).map((t: any) => {
+          const desc = t?.description ? ` — ${t.description}` : "";
+          return `- ${t.name}${desc}`;
+        });
+
+        const msg =
+          lines.length > 0
+            ? `Available tools (${lines.length}):\n` + lines.join("\n")
+            : "No tools available. Open the Tools tab and click “List tools” (and ensure MCP is connected).";
+
+        setChats((prev) => {
+          const next = prev.map((c) => {
+            if (c.id !== chat!.id) return c;
+            const msgs = c.messages.map((m) => (m.id === assistantMsgId ? { ...m, content: msg } : m));
+            return { ...c, updatedAt: Date.now(), messages: msgs };
+          });
+          saveChats(next);
+          return next;
+        });
+      } catch (e: any) {
+        appendToolLog({
+          id: `tl-${Date.now()}`,
+          ts: Date.now(),
+          tool: "mcp_list_tools",
+          args: {},
+          ok: false,
+          error: e?.message || String(e),
+        });
+
+        setChats((prev) => {
+          const next = prev.map((c) => {
+            if (c.id !== chat!.id) return c;
+            const msgs = c.messages.map((m) =>
+              m.id === assistantMsgId ? { ...m, content: `[tool error] ${e?.message || String(e)}` } : m
+            );
+            return { ...c, updatedAt: Date.now(), messages: msgs };
+          });
+          saveChats(next);
+          return next;
+        });
+      }
+      return;
+    }
+        // /read <path>  -> fs.read_file
+    if (trimmed.toLowerCase().startsWith("/read ")) {
+      const path = trimmed.slice(6).trim();
+      try {
+        if (!path) throw new Error("Usage: /read C:/path/to/file");
+
+        const out = await mcpCallTool("fs.read_file", { path });
+        appendToolLog({ id: `tl-${Date.now()}`, ts: Date.now(), tool: "fs.read_file", args: { path }, ok: true, result: out });
+
+        const formatted = formatToolResult("fs.read_file", out);
+        if (formatted.isError) throw new Error(formatted.text || "Tool returned error");
+
+        setChats((prev) => {
+          const next = prev.map((c) => {
+            if (c.id !== chat!.id) return c;
+            const msgs = c.messages.map((m) => (m.id === assistantMsgId ? { ...m, content: formatted.text } : m));
+            return { ...c, updatedAt: Date.now(), messages: msgs };
+          });
+          saveChats(next);
+          return next;
+        });
+      } catch (e: any) {
+        appendToolLog({ id: `tl-${Date.now()}`, ts: Date.now(), tool: "fs.read_file", args: { path }, ok: false, error: e?.message || String(e) });
+        setChats((prev) => {
+          const next = prev.map((c) => {
+            if (c.id !== chat!.id) return c;
+            const msgs = c.messages.map((m) => (m.id === assistantMsgId ? { ...m, content: `[tool error] ${e?.message || String(e)}` } : m));
+            return { ...c, updatedAt: Date.now(), messages: msgs };
+          });
+          saveChats(next);
+          return next;
+        });
+      }
+      return;
+    }
+
+    // /grep <pattern> <dir> -> fs.search_files
+    if (trimmed.toLowerCase().startsWith("/grep ")) {
+      const rest = trimmed.slice(6).trim();
+      try {
+        if (!rest) throw new Error("Usage: /grep <pattern> <dir>. Example: /grep TODO C:/Dev/Nikolai-desktop");
+
+        // split into: pattern + dir (dir is last token)
+        const parts = rest.split(" ").map((x) => x.trim()).filter(Boolean);
+        if (parts.length < 2) throw new Error("Usage: /grep <pattern> <dir>");
+
+        const dir = parts[parts.length - 1];
+        const pattern = parts.slice(0, parts.length - 1).join(" ");
+
+                const base = dir.replace(/\/+$/, "");
+        const isCodeFolder = /\/src(?:-tauri)?$/i.test(base);
+
+        const targets = isCodeFolder ? [base] : [`${base}/src`, `${base}/src-tauri`];
+
+        let allMatches: any[] = [];
+        for (const p of targets) {
+          try {
+            const r = await mcpCallTool("fs.search_files", { path: p, query: pattern });
+            // Collect common shapes: {matches: [...] } or { success:true, matches:[...] }
+            const m = (r && (r.matches || (r.success ? r.matches : null))) || [];
+            if (Array.isArray(m)) allMatches = allMatches.concat(m);
+          } catch {
+            // ignore per-target failures
+          }
+        }
+
+        const out = { success: true, matches: allMatches, total: allMatches.length, searched: targets };appendToolLog({ id: `tl-${Date.now()}`, ts: Date.now(), tool: "fs.search_files", args: { path: dir, query: pattern }, ok: true, result: out });
+
+        const formatted = formatToolResult("fs.search_files", out);
+        if (formatted.isError) throw new Error(formatted.text || "Tool returned error");
+
+        setChats((prev) => {
+          const next = prev.map((c) => {
+            if (c.id !== chat!.id) return c;
+            const msgs = c.messages.map((m) => (m.id === assistantMsgId ? { ...m, content: formatted.text } : m));
+            return { ...c, updatedAt: Date.now(), messages: msgs };
+          });
+          saveChats(next);
+          return next;
+        });
+      } catch (e: any) {
+        appendToolLog({ id: `tl-${Date.now()}`, ts: Date.now(), tool: "fs.search_files", args: { raw: rest }, ok: false, error: e?.message || String(e) });
+        setChats((prev) => {
+          const next = prev.map((c) => {
+            if (c.id !== chat!.id) return c;
+            const msgs = c.messages.map((m) => (m.id === assistantMsgId ? { ...m, content: `[tool error] ${e?.message || String(e)}` } : m));
+            return { ...c, updatedAt: Date.now(), messages: msgs };
+          });
+          saveChats(next);
+          return next;
+        });
+      }
+      return;
+    }
+const toolCmd = parseToolCommand(text);
+    if (toolCmd) {
+      try {
+        if (toolCmd.args?.__parse_error__) {
+          throw new Error(toolCmd.args.__parse_error__);
+        }
+
+        const out = await mcpCallTool(toolCmd.name, toolCmd.args || {});
+        const formatted = formatToolResult(toolCmd.name, out);
+        if (formatted.isError) {
+          throw new Error(formatted.text || "Tool returned error");
+        }
+appendToolLog({
+          id: `tl-${Date.now()}`,
+          ts: Date.now(),
+          tool: toolCmd.name,
+          args: toolCmd.args || {},
+          ok: true,
+          result: out,
+        });
+
+        setChats((prev) => {
+          const next = prev.map((c) => {
+            if (c.id !== chat!.id) return c;
+            const msgs = c.messages.map((m) =>
+              m.id === assistantMsgId ? { ...m, content: formatted.text } : m
+            );
+            return { ...c, updatedAt: Date.now(), messages: msgs };
+          });
+          saveChats(next);
+          return next;
+        });
+      } catch (e: any) {
+        appendToolLog({
+          id: `tl-${Date.now()}`,
+          ts: Date.now(),
+          tool: toolCmd.name,
+          args: toolCmd.args || {},
+          ok: false,
+          error: e?.message || String(e),
+        });
+
+        setChats((prev) => {
+          const next = prev.map((c) => {
+            if (c.id !== chat!.id) return c;
+            const msgs = c.messages.map((m) =>
+              m.id === assistantMsgId ? { ...m, content: `[tool error] ${e?.message || String(e)}` } : m
+            );
+            return { ...c, updatedAt: Date.now(), messages: msgs };
+          });
+          saveChats(next);
+          return next;
+        });
+      }
+      return;
+    }
+
+    // OLLAMA STREAM PATH
+    setIsStreaming(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      const currentChats = loadChats();
+      const currentChat = currentChats.find((c) => c.id === chat!.id);
+      const history = (currentChat?.messages || []).map((m) => ({ role: m.role, content: m.content }));
+
+      await ollamaStreamChat({
+        baseUrl: provider.ollamaBaseUrl,
+        model: provider.ollamaModel,
+        messages: history,
+        signal: controller.signal,
+        onToken: (t) => {
+          setChats((prev) => {
+            const next = prev.map((c) => {
+              if (c.id !== chat!.id) return c;
+              const msgs = c.messages.map((m) => (m.id === assistantMsgId ? { ...m, content: m.content + t } : m));
+              return { ...c, updatedAt: Date.now(), messages: msgs };
+            });
+            saveChats(next);
+            return next;
+          });
+        },
+      });
+    } catch (e: any) {
+      const msg = e?.name === "AbortError" ? "[stopped]" : `\n\n[error] ${e?.message || String(e)}`;
+      setChats((prev) => {
+        const next = prev.map((c) => {
+          if (c.id !== chat!.id) return c;
+          const msgs = c.messages.map((m) => (m.id === assistantMsgId ? { ...m, content: (m.content || "") + msg } : m));
+          return { ...c, updatedAt: Date.now(), messages: msgs };
+        });
+        saveChats(next);
+        return next;
+      });
+    } finally {
+      abortRef.current = null;
+      setIsStreaming(false);
+    }
+  };
+
+  return (
+    <ResizableShell
+      left={
+        <ChatHistory
+          collapsed={leftCollapsed}
+          chats={chats}
+          activeId={activeId}
+          onSelect={selectChat}
+          onCreate={createChat}
+          onDelete={deleteChat}
+          onRename={renameChat}
+        />
+      }
+      center={<ChatCenter chat={activeChat} onSend={send} isStreaming={isStreaming} onStop={stop} />}
+      right={<RightPanel collapsed={rightCollapsed} provider={provider} setProvider={setProvider} />}
+      onToggleLeft={(c) => setLeftCollapsed(c)}
+      onToggleRight={(c) => setRightCollapsed(c)}
+    />
+  );
+}
+
+
+
+
+
+
+

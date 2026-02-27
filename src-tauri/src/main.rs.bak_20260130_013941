@@ -1,0 +1,24 @@
+﻿#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+
+mod mcp;
+mod secrets;
+
+fn main() {
+  tauri::Builder::default()
+    .invoke_handler(tauri::generate_handler![
+      // MCP
+      mcp::mcp_status,
+      mcp::mcp_info,
+      mcp::mcp_connect,
+      mcp::mcp_disconnect,
+      mcp::mcp_list_tools,
+      mcp::mcp_call_tool,
+
+      // Secrets (OS keychain)
+      secrets::secret_set,
+      secrets::secret_get,
+      secrets::secret_delete
+    ])
+    .run(tauri::generate_context!())
+    .expect("error while running tauri application");
+}

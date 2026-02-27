@@ -1,0 +1,221 @@
+
+================================================================================
+Nikolai MCP Diagnostics - Summary
+================================================================================
+Root: C:\Dev\Nikolai-desktop
+Date: 2026-02-25T17:05:05
+User: jackson
+Node: v20.20.0
+NPM:  10.8.2
+
+================================================================================
+Files existence
+================================================================================
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts => True
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx => True
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx => True
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs => True
+C:\Dev\Nikolai-desktop\package.json => True
+C:\Dev\Nikolai-desktop\src-tauri\tauri.conf.json => True
+
+================================================================================
+Backend: src-tauri/src/mcp.rs key matches
+================================================================================
+
+--- Matches in: C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs | Pattern: mcp_list_tools ---
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:562: pub async fn mcp_list_tools() -> Result<Vec<McpTool>, String> {
+
+--- Matches in: C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs | Pattern: mcp_connect ---
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:322: pub async fn mcp_connect(
+
+--- Matches in: C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs | Pattern: mcp_disconnect ---
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:528: pub async fn mcp_disconnect(app: AppHandle) -> Result<McpStatus, String> {
+
+--- Matches in: C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs | Pattern: \#\[tauri::command\] ---
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:294: #[tauri::command]
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:313: #[tauri::command]
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:321: #[tauri::command]
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:527: #[tauri::command]
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:561: #[tauri::command]
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:582: #[tauri::command]
+
+--- Matches in: C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs | Pattern: emit ---
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:99: fn emit_state_change(app: &AppHandle, state: &str, message: Option<String>) {
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:105:   let _ = app.emit_all("mcp://state", payload);
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:178:       emit_state_change(&app, "error", Some("Buffer overflow".to_string()));
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:339:         emit_state_change(&app, "connecting", Some(cfg_summary.clone()));
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:361:     emit_state_change(&app, "error", Some("Command is empty".to_string()));
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:386:       emit_state_change(&app, "error", Some(format!("spawn failed: {}", e)));
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:461:       emit_state_change(&app, "connected", None);
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:491:       emit_state_change(&app, "error", Some(format!("Initialization failed: {}", e)));
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:520:       emit_state_change(&app, "error", Some("Initialization timed out".to_string()));
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:541:   emit_state_change(&app, "disconnected", None);
+
+--- Matches in: C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs | Pattern: mcp://state ---
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:105:   let _ = app.emit_all("mcp://state", payload);
+
+--- Matches in: C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs | Pattern: initialize ---
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:427:   // Initialize with timeout
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:432:       "initialize",
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:453:       let _ = notify_with_client(client.clone(), "notifications/initialized", json!({})).await;
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:463:       println!("[mcp] initialize success");
+
+--- Matches in: C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs | Pattern: tools ---
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:436:         "capabilities": { "tools": {} }
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:562: pub async fn mcp_list_tools() -> Result<Vec<McpTool>, String> {
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:563:   let v = request("tools/list", json!({})).await?;
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:564:   let tools = v.get("tools").cloned().unwrap_or(Value::Array(vec![]));
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:567:   if let Value::Array(arr) = tools {
+C:\Dev\Nikolai-desktop\src-tauri\src\mcp.rs:585:     "tools/call",
+
+================================================================================
+Frontend: src/lib/mcp.ts key matches
+================================================================================
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\lib\mcp.ts | Pattern: invoke\( ---
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:40:   return await invoke("mcp_status");
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:45:   return await invoke("mcp_connect", { cfg });
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:50:   return await invoke("mcp_disconnect");
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:55:   return await invoke("mcp_list_tools");
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:60:   return await invoke("mcp_call_tool", { name, args });
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:65:   return await invoke("mcp_info");
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\lib\mcp.ts | Pattern: mcp_list_tools ---
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:55:   return await invoke("mcp_list_tools");
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\lib\mcp.ts | Pattern: mcp_status ---
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:40:   return await invoke("mcp_status");
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\lib\mcp.ts | Pattern: listen\( ---
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:72:   return await listen("mcp://state", (event) => {
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\lib\mcp.ts | Pattern: mcp://state ---
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:72:   return await listen("mcp://state", (event) => {
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\lib\mcp.ts | Pattern: useMcp ---
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:253: export function useMcp() {
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\lib\mcp.ts | Pattern: refreshTools ---
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:202: // Exported refreshTools - can be called directly
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:203: export async function refreshTools(): Promise<string[]> {
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:268:     refreshTools,
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\lib\mcp.ts | Pattern: tools\.length ---
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:123:       if (tools.length > 0) {
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:124:         console.log(`[MCP] Loaded ${tools.length} tools on attempt ${attempt}`);
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\lib\mcp.ts | Pattern: Array\.isArray ---
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:120:       const toolsRaw = Array.isArray(res) ? res : [];
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\lib\mcp.ts | Pattern: map\( ---
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:121:       const tools = toolsRaw.map((t: any) => t.name || String(t));
+
+================================================================================
+Frontend: ToolsPanel.tsx key matches
+================================================================================
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx | Pattern: tools ---
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:68: export default function ToolsPanel({ onInsertToComposer }: Props) {
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:76:   const { mcpState, tools, error, loading, connected, connect, disconnect, refreshTools } = useMcp();
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:171:   const toolLog = useMemo(() => loadToolLog().slice(-30).reverse(), [mcpState, error, connected, tools.length]);
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:198:             <div className="text-xs font-semibold opacity-80">MCP Tools</div>
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:216:               DEBUG: state={mcpState} | tools={tools.length} | error={error || "none"}
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:263:               <button className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm" onClick={refreshTools} disabled={!connected}>
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:264:                 List tools
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:273:             <div className="text-xs font-semibold opacity-80 mb-2">Tools</div>
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:274:             {tools.length === 0 ? (
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:275:               <div className="text-xs opacity-60">No tools loaded yet.</div>
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:278:                 {tools.slice(0, 40).map((t) => (
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:287:                 {tools.length > 40 ? <div className="text-xs opacity-50">…and {tools.length - 40} more</div> : null}
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx | Pattern: useMcp ---
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:12: import { useMcp } from "../lib/mcp";
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:76:   const { mcpState, tools, error, loading, connected, connect, disconnect, refreshTools } = useMcp();
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx | Pattern: List tools ---
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:264:                 List tools
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx | Pattern: onClick ---
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:185:         <button className={`px-3 py-2 rounded ${subtab === "mcp" ? "bg-white/10" : "bg-transparent"} hover:bg-white/10`} onClick={() => setSubtab("mcp")}>
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:188:         <button className={`px-3 py-2 rounded ${subtab === "workspace" ? "bg-white/10" : "bg-transparent"} hover:bg-white/10`} onClick={() => setSubtab("workspace")}>
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:220:               <button className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm" onClick={createProfile}>New</button>
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:221:               <button className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm" onClick={renameProfile} disabled={!activeProfile}>Rename</button>
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:222:               <button className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm" onClick={deleteProfile} disabled={!activeProfile}>Delete</button>
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:257:               <button className="px-3 py-2 rounded-md bg-blue-600 hover:bg-blue-500 text-sm font-semibold" onClick={handleConnect} disabled={!activeProfile?.command || loading}>
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:260:               <button className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm" onClick={disconnect} disabled={loading}>
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:263:               <button className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm" onClick={refreshTools} disabled={!connected}>
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:282:                     onClick={() => onInsertToComposer?.(`/tool ${t} {}`)}
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx | Pattern: mcp ---
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:5:   loadMcpProfiles,
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:6:   saveMcpProfiles,
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:7:   loadActiveMcpProfileId,
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:8:   saveActiveMcpProfileId,
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:9:   type McpProfile,
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:12: import { useMcp } from "../lib/mcp";
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:69:   const [subtab, setSubtab] = useState<"mcp" | "workspace">("mcp");
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:71:   // MCP profiles
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:72:   const [profiles, setProfiles] = useState<McpProfile[]>(() => loadMcpProfiles());
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:73:   const [activeId, setActiveId] = useState<string | null>(() => loadActiveMcpProfileId());
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:75:   // Shared MCP state from hook (single source of truth)
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:76:   const { mcpState, tools, error, loading, connected, connect, disconnect, refreshTools } = useMcp();
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:84:     const p: McpProfile = {
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:85:       id: uid("mcp"),
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:86:       name: "Default MCP",
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:96:     saveMcpProfiles(next);
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:98:     saveActiveMcpProfileId(p.id);
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:103:     saveActiveMcpProfileId(activeId);
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:109:       if (subtab !== "mcp") return;
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:123:   function updateProfile(patch: Partial<McpProfile>) {
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:127:     saveMcpProfiles(next);
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:131:     const name = prompt("New MCP profile name", "New MCP");
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:134:     const p: McpProfile = {
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:135:       id: uid("mcp"),
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:146:     saveMcpProfiles(next);
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:148:     saveActiveMcpProfileId(p.id);
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:153:     const name = prompt("Rename MCP profile", activeProfile.name);
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:160:     if (!confirm(`Delete MCP profile "${activeProfile.name}"?`)) return;
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:164:     saveMcpProfiles(next);
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:168:     saveActiveMcpProfileId(nextActive);
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:171:   const toolLog = useMemo(() => loadToolLog().slice(-30).reverse(), [mcpState, error, connected, tools.length]);
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:185:         <button className={`px-3 py-2 rounded ${subtab === "mcp" ? "bg-white/10" : "bg-transparent"} hover:bg-white/10`} onClick={() => setSubtab("mcp")}>
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:186:           MCP
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:195:       {subtab === "mcp" ? (
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:198:             <div className="text-xs font-semibold opacity-80">MCP Tools</div>
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:199:             <div className="text-xs opacity-70">{mcpState}</div>
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:214:             {/* DEBUG: Show MCP state info */}
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:216:               DEBUG: state={mcpState} | tools={tools.length} | error={error || "none"}
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:240:               placeholder='e.g. server.js --config mcp-hub.config.json'
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:248:               placeholder='e.g. C:\Users\jackson\DEV\qwen-lab\mcp-hub'
+
+================================================================================
+Frontend: ChatCenter.tsx key matches
+================================================================================
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx | Pattern: useMcp ---
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:5: import { useMcp } from "../lib/mcp";
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:146:   const { mcpState, tools, error, connected, connect, refreshTools } = useMcp();
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx | Pattern: mcpState ---
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:146:   const { mcpState, tools, error, connected, connect, refreshTools } = useMcp();
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:147:   const mcpConnected = mcpState === "connected";
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:220:             MCP: {mcpState}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:223:           {(mcpState !== "connected" || mcpDegraded) && (
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx | Pattern: mcpConnected ---
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:147:   const mcpConnected = mcpState === "connected";
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:219:           <span className={`px-2 py-0.5 rounded border border-white/10 ${mcpConnected ? "bg-white/10" : ""}`}>
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:238:           {mcpConnected && (
+
+--- Matches in: C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx | Pattern: refreshTools ---
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:146:   const { mcpState, tools, error, connected, connect, refreshTools } = useMcp();
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:241:               onClick={refreshTools}
+
+================================================================================
+DONE
+================================================================================
+Generated:
+  C:\Dev\Nikolai-desktop\mcp-diag\SUMMARY.txt
+  C:\Dev\Nikolai-desktop\mcp-diag\RAW_FILES_WITH_LINES.txt
+
+NEXT: Paste SUMMARY.txt here (not the raw file).

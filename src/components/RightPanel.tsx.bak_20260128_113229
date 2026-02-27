@@ -1,0 +1,85 @@
+import React, { useState } from "react";
+import type { ProviderConfig } from "../types";
+import ToolsPanel from "./ToolsPanel";
+
+type Props = {
+  collapsed: boolean;
+  provider: ProviderConfig;
+  setProvider: (p: ProviderConfig) => void;
+  onInsertToComposer?: (text: string) => void;
+};
+
+export default function RightPanel({ collapsed, provider, setProvider, onInsertToComposer }: Props) {
+  const [tab, setTab] = useState<"providers" | "tools" | "about">("providers");
+
+  if (collapsed) {
+    return <div className="h-full w-full" />;
+  }
+
+  return (
+    <div className="h-full flex flex-col border-l border-white/10">
+      <div className="h-12 flex items-center gap-2 px-3 border-b border-white/10">
+        <button
+          className={`px-3 py-1 rounded ${tab === "providers" ? "bg-white/10" : "bg-transparent"} hover:bg-white/10`}
+          onClick={() => setTab("providers")}
+        >
+          Providers
+        </button>
+        <button
+          className={`px-3 py-1 rounded ${tab === "tools" ? "bg-white/10" : "bg-transparent"} hover:bg-white/10`}
+          onClick={() => setTab("tools")}
+        >
+          Tools
+        </button>
+        <button
+          className={`px-3 py-1 rounded ${tab === "about" ? "bg-white/10" : "bg-transparent"} hover:bg-white/10`}
+          onClick={() => setTab("about")}
+        >
+          About
+        </button>
+      </div>
+
+      <div className="flex-1 overflow-auto">
+        {tab === "providers" && (
+          <div className="p-3 space-y-3 text-sm">
+            <div className="font-semibold">Active Provider</div>
+
+            <div className="space-y-2 border border-white/10 rounded-lg p-3 bg-white/5">
+              <div className="text-xs opacity-70">Ollama (local / LAN)</div>
+
+              <label className="block text-xs opacity-70">Base URL</label>
+              <input
+                className="w-full rounded-md bg-black/30 border border-white/10 px-2 py-1 outline-none focus:border-white/30"
+                value={provider.ollamaBaseUrl}
+                onChange={(e) => setProvider({ ...provider, ollamaBaseUrl: e.target.value })}
+              />
+
+              <label className="block text-xs opacity-70">Model</label>
+              <input
+                className="w-full rounded-md bg-black/30 border border-white/10 px-2 py-1 outline-none focus:border-white/30"
+                value={provider.ollamaModel}
+                onChange={(e) => setProvider({ ...provider, ollamaModel: e.target.value })}
+              />
+
+              <div className="text-xs opacity-60">
+                Tip: Use your LAN Ollama like <code className="opacity-90">http://192.168.0.79:11436</code>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {tab === "tools" && <ToolsPanel onInsertToComposer={onInsertToComposer} />}
+
+        {tab === "about" && (
+          <div className="p-3 text-sm space-y-2">
+            <div className="font-semibold">Nikolai Desktop</div>
+            <div className="opacity-70">D2: MCP tools MVP (stdio sidecar)</div>
+            <div className="text-xs opacity-70">
+              Use chat command: <code>/tool tool_name {"{...}"}</code>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

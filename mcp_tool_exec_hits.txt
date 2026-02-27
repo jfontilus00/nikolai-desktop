@@ -1,0 +1,5 @@
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:59: export async function mcpCallTool(name: string, args: any): Promise<any> {
+C:\Dev\Nikolai-desktop\src\lib\mcp.ts:61: return await invoke("mcp_call_tool", { name, args });
+C:\Dev\Nikolai-desktop\src\App.tsx:264: return await withTimeout(mcpCallTool(name, normalizedArgs), TOOL_TIMEOUT_MS, `Tool timeout: ${name}`);
+C:\Dev\Nikolai-desktop\src\App.tsx:274: return await withTimeout(mcpCallTool(name, normalizedArgs), TOOL_TIMEOUT_MS, `Tool timeout: ${name}`);
+C:\Dev\Nikolai-desktop\src\App.tsx:551: const out = await mcpCallTool(toolCmd.name, toolCmd.args || {});
