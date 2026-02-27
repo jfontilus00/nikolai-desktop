@@ -7,3 +7,8 @@ target/
 .env
 .env.*
 .nikolai_backups/
+# backups / logs
+_backups/
+*.bak
+*.bak_*
+nikolai-*.log
