@@ -37,9 +37,9 @@ function shouldUseAgentic(text: string) {
 
   if (t.startsWith("use tool") || t.startsWith("run tool") || t.startsWith("call tool")) return true;
 
-  // Verb list is intentionally narrow. "find", "get", "show me", "give me" removed
-  // because they fire on casual phrases ("find me a recipe", "get me a summary").
-  // These verbs only make sense when paired with a genuine file noun below.
+  // Memory triggers — "remember X", "note that X", "save that X", "forget X"
+  if (/\b(remember|note that|save that|forget|add to memory|store this)\b/.test(t)) return true;
+
   const actionVerbs = /\b(read|open|write|create|generate|export|analyse|analyze|refactor|fix|update|edit|search|list)\b/;
   const fileNouns   = /\b(file|files|folder|directory|project|codebase|repo|docx|pdf|pptx|xlsx|report|diagram|mermaid|source)\b/;
 
@@ -216,17 +216,157 @@ export default function App() {
   };
 
   function normalizeWinPath(p: string) {
-    return String(p || "").trim().replace(/^"(.*)"$/, "$1").replace(/\\/g, "/");
+    let s = String(p || "").trim().replace(/^"(.*)"$/, "$1");
+    // Strip Windows \\?\\ extended-length prefix added by Rust canonicalize()
+    // Use startsWith to avoid regex escaping nightmares
+    if (s.startsWith("\\\\?\\")) s = s.slice(4);
+    // Also handle the forward-slash variant just in case it ever appears
+    if (s.startsWith("//?/")) s = s.slice(4);
+    return s.replace(/\\/g, "/");
   }
 
-  function normalizeFsArgs(_tool: string, a: any) {
+  // True for bare filenames like "foo.txt" or "subdir/foo.txt".
+  // False for absolute paths like "C:/..." or "/usr/..." or "//UNC/..."
+  function isRelativePath(p: string): boolean {
+    if (!p) return false;
+    const n = p.replace(/\\/g, "/");
+    if (/^[a-zA-Z]:/.test(n)) return false; // Windows absolute: C:/...
+    if (n.startsWith("/"))     return false; // Unix or UNC: /... or //...
+    return true;
+  }
+
+  const FS_LIKE_TOOL_BASES = new Set([
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_directory",
+    "search_files",
+    "create_directory",
+    "delete_file",
+    "copy_file",
+    "move_file",
+    "rename_file",
+  ]);
+
+  function isFsLikeToolName(toolName: string): boolean {
+    if (!toolName) return false;
+    if (toolName.startsWith("fs.")) return true;
+    const base = toolName.split(".").pop() ?? toolName;
+    return FS_LIKE_TOOL_BASES.has(base);
+  }
+
+  function coerceFileOpArgs(toolName: string, args: any) {
+    const a = args && typeof args === "object" ? { ...args } : {};
+    const base = toolName.split(".").pop() ?? toolName;
+
+    if (base === "copy_file" || base === "move_file" || base === "rename_file") {
+      const paths = Array.isArray(a.paths) ? a.paths : null;
+      const src =
+        a.src ?? a.from ?? a.source ?? a.oldPath ?? (paths ? paths[0] : undefined);
+      const dst =
+        a.dst ?? a.to ?? a.destination ?? a.newPath ?? (paths ? paths[1] : undefined);
+
+      if (typeof src === "string") {
+        if (a.src == null) a.src = src;
+        if (a.from == null) a.from = src;
+        if (a.source == null) a.source = src;
+        if (a.oldPath == null) a.oldPath = src;
+      }
+      if (typeof dst === "string") {
+        if (a.dst == null) a.dst = dst;
+        if (a.to == null) a.to = dst;
+        if (a.destination == null) a.destination = dst;
+        if (a.newPath == null) a.newPath = dst;
+      }
+      if (a.paths == null && typeof src === "string" && typeof dst === "string") {
+        a.paths = [src, dst];
+      }
+    }
+
+    return a;
+  }
+
+  // NEW: for Windows, enforce paths stay under workspace root (case-insensitive)
+  function toRelUnderRoot(absPath: string, absRoot: string): string | null {
+    const root = normalizeWinPath(absRoot).replace(/\/+$/, "");
+    const p    = normalizeWinPath(absPath);
+
+    const rootLower = root.toLowerCase();
+    const pathLower = p.toLowerCase();
+
+    if (pathLower === rootLower) return "";
+    if (pathLower.startsWith(rootLower + "/")) {
+      return p.slice(root.length + 1);
+    }
+    return null;
+  }
+
+  // NEW: enforce fs.* absolute paths must be under wsRoot (and normalize them)
+  function enforceFsArgsUnderRoot(toolName: string, args: any, wsRoot?: string | null) {
+    // Apply ONLY to filesystem-like tools (fs.* OR bare write_file/copy_file/etc.)
+    if (!isFsLikeToolName(toolName)) return;
+
+    // Fail-safe: if workspace root is unknown, do not allow filesystem tools to run
+    if (!wsRoot) {
+      throw new Error(`${toolName}: workspace root not available  set workspace root before using filesystem tools.`);
+    }
+
+    const root = normalizeWinPath(wsRoot).replace(/\/+$/, "");
+    const a = args && typeof args === "object" ? args : {};
+
+    for (const k of ["path", "src", "dst", "from", "to", "source", "destination", "oldPath", "newPath"]) {
+      const v = (a as any)[k];
+      if (typeof v !== "string" || !v.trim()) continue;
+
+      const p = normalizeWinPath(v);
+
+      // Relative is fine (it will be rooted by normalizeFsArgs)
+      if (isRelativePath(p)) continue;
+
+      // Absolute: must be under root
+      const rel = toRelUnderRoot(p, root);
+      if (rel === null) {
+        throw new Error(
+          `${toolName}: path outside workspace root (arg "${k}"). Use a RELATIVE path.\n` +
+          `path: ${p}\nroot: ${root}`
+        );
+      }
+
+      // Normalize absolute-under-root to a clean rooted absolute path
+      (a as any)[k] = rel ? `${root}/${rel}` : root;
+    }
+  }
+
+  // Resolve paths against workspace root. wsRoot must be passed in explicitly
+  // because this function is called from both sync and async contexts.
+  function normalizeFsArgs(_tool: string, a: any, wsRoot?: string | null) {
     const args = a && typeof a === "object" ? { ...a } : {};
-    for (const k of ["path", "src", "dst", "from", "to"]) {
+    for (const k of ["path", "src", "dst", "from", "to", "source", "destination", "oldPath", "newPath"]) {
       if (typeof (args as any)[k] === "string") {
-        (args as any)[k] = normalizeWinPath((args as any)[k]);
+        let p = normalizeWinPath((args as any)[k]);
+        // Relative path — prepend workspace root so MCP server accepts it
+        if (wsRoot && isRelativePath(p)) {
+          const root = normalizeWinPath(wsRoot).replace(/\/+$/, "");
+          p = `${root}/${p}`;
+        }
+        (args as any)[k] = p;
       }
     }
     return args;
+  }
+
+  // Shared helper — fetches workspace root from Tauri once per tool call
+  async function getWsRoot(): Promise<string | null> {
+    try {
+      const { invoke } = await import("@tauri-apps/api/tauri");
+      const raw = await invoke<string | null>("ws_get_root");
+      if (!raw) return null;
+      // Strip Windows \\?\\ extended-length prefix (added by Rust canonicalize())
+      // before using as workspace root — MCP server does not understand this prefix.
+      if (raw.startsWith("\\\\?\\")) return raw.slice(4).replace(/\\/g, "/");
+      if (raw.startsWith("//?/")) return raw.slice(4).replace(/\\/g, "/");
+      return raw.replace(/\\/g, "/");
+    } catch { return null; }
   }
 
   function validateToolArgs(tool: string, args: any): { ok: true } | { ok: false; error: string } {
@@ -248,7 +388,13 @@ export default function App() {
   }
 
   const executeToolWithApproval = async (name: string, args: any) => {
-    const normalizedArgs = normalizeFsArgs(name, args);
+    const wsRoot = await getWsRoot();
+    const coercedArgs = coerceFileOpArgs(name, args);
+    const normalizedArgs = normalizeFsArgs(name, coercedArgs, wsRoot);
+
+    // NEW: block absolute paths outside root for fs.* tools
+    enforceFsArgsUnderRoot(name, normalizedArgs, wsRoot);
+
     const v = validateToolArgs(name, normalizedArgs);
     if (!v.ok) throw new Error(`Tool args invalid: ${v.error}`);
 
@@ -337,7 +483,6 @@ export default function App() {
   // Tracks last spoken text to avoid re-speaking the same message on re-render
   const lastSpokenRef = useRef<string>("");
 
-
   // Truncates to 40 chars — enough to distinguish chats in the sidebar.
   const autoTitleChat = useCallback((chatId: string, userText: string) => {
     setChats((prev) => {
@@ -423,16 +568,26 @@ export default function App() {
       const onStatus = (s: string) => setAgentStatus(s);
       const isOllama = ((provider as any)?.kind || "ollama") === "ollama";
 
-      if (isOllama && shouldUseAgentic(prompt) && getCachedTools().length > 0) {
+      if (shouldUseAgentic(prompt) && getCachedTools().length > 0) {
+        const agenticChatFn = isOllama ? undefined : async (msgs: any[], signal: AbortSignal) => {
+          let result = "";
+          await streamChatWithProvider({ provider, messages: msgs, signal, onToken: (t: string) => { result += t; } });
+          return result;
+        };
+        const agenticStreamFn = isOllama ? undefined : async (msgs: any[], signal: AbortSignal, onTok: (t: string) => void) => {
+          await streamChatWithProvider({ provider, messages: msgs, signal, onToken: onTok });
+        };
         await agenticStreamChat({
           baseUrl: provider.ollamaBaseUrl,
           model: provider.ollamaModel,
           messages: baseHistory as any,
           signal: controller.signal,
           onToken, onStatus,
-          maxSteps: 10,
+          maxSteps: 12,
           executeTool: executeToolWithApproval,
           plannerModel: ((provider as any)?.ollamaPlannerModel || provider.ollamaModel),
+          chatFn: agenticChatFn,
+          streamFn: agenticStreamFn,
         });
       } else {
         if (isOllama) {
@@ -527,8 +682,16 @@ export default function App() {
         return;
       }
 
+      // Resolve relative paths in /tool commands the same way as agentic tool calls
       try {
-        const out = await mcpCallTool(toolCmd.name, toolCmd.args || {});
+        const wsRootForCmd = await getWsRoot();
+        const coercedArgs = coerceFileOpArgs(toolCmd.name, toolCmd.args || {});
+        const resolvedArgs = normalizeFsArgs(toolCmd.name, coercedArgs, wsRootForCmd);
+
+        // NEW: block absolute paths outside root for fs.* tools
+        enforceFsArgsUnderRoot(toolCmd.name, resolvedArgs, wsRootForCmd);
+
+        const out = await mcpCallTool(toolCmd.name, resolvedArgs);
         const formatted = formatToolResult(toolCmd.name, out);
         if (formatted.isError) throw new Error(formatted.text || "Tool returned error");
         setChats((prev) => {
@@ -593,16 +756,27 @@ export default function App() {
       // Guard: only attempt agentic if MCP tools are loaded.
       // getCachedTools() returns [] when MCP is disconnected — no point starting
       // the planner when it will immediately fail with "no tools available".
-      if (isOllama && shouldUseAgentic(text) && getCachedTools().length > 0) {
+      if (shouldUseAgentic(text) && getCachedTools().length > 0) {
+        // Build provider-agnostic planner/stream fns so any provider can drive tools
+        const agenticChatFn = isOllama ? undefined : async (msgs: any[], signal: AbortSignal) => {
+          let result = "";
+          await streamChatWithProvider({ provider, messages: msgs, signal, onToken: (t: string) => { result += t; } });
+          return result;
+        };
+        const agenticStreamFn = isOllama ? undefined : async (msgs: any[], signal: AbortSignal, onTok: (t: string) => void) => {
+          await streamChatWithProvider({ provider, messages: msgs, signal, onToken: onTok });
+        };
         await agenticStreamChat({
           baseUrl: provider.ollamaBaseUrl,
           model: provider.ollamaModel,
           messages: historyWithSys as any,
           signal: controller.signal,
           onToken, onStatus,
-          maxSteps: 10,
+          maxSteps: 12,
           executeTool: executeToolWithApproval,
           plannerModel: ((provider as any)?.ollamaPlannerModel || provider.ollamaModel),
+          chatFn: agenticChatFn,
+          streamFn: agenticStreamFn,
         });
       } else {
         if (isOllama) {

@@ -1,33 +1,40 @@
-# Nikolai Desktop -- DEEP CODE INSPECTION
-# This script reads your actual source files and reports
-# what is solid, what is weak, and what should be improved.
+# ============================================================
+# Atelier NikolAi Desktop — System & Code Inspection v2
+# Checks: runtime tools, voice pack, V4 features, code health
 # Run from project root: .\inspect.ps1
 # ============================================================
 
 $ErrorActionPreference = "SilentlyContinue"
-$script:solid  = 0
-$script:weak   = 0
-$script:risk   = 0
-$script:log    = @()
+$script:solid    = 0
+$script:weak     = 0
+$script:risk     = 0
+$script:missing  = 0
+$script:log      = @()
 $script:findings = @()
 
 function SOLID ($area, $msg) {
-    Write-Host "  [SOLID] $area -- $msg" -ForegroundColor Green
+    Write-Host "  [SOLID]   $area -- $msg" -ForegroundColor Green
     $script:solid++
-    $script:log += "[SOLID] $area -- $msg"
     $script:findings += [PSCustomObject]@{ Level="SOLID"; Area=$area; Message=$msg }
+    $script:log += "[SOLID]   $area -- $msg"
 }
 function WEAK ($area, $msg) {
-    Write-Host "  [WEAK]  $area -- $msg" -ForegroundColor Yellow
+    Write-Host "  [WEAK]    $area -- $msg" -ForegroundColor Yellow
     $script:weak++
-    $script:log += "[WEAK]  $area -- $msg"
     $script:findings += [PSCustomObject]@{ Level="WEAK"; Area=$area; Message=$msg }
+    $script:log += "[WEAK]    $area -- $msg"
 }
 function RISK ($area, $msg) {
-    Write-Host "  [RISK]  $area -- $msg" -ForegroundColor Red
+    Write-Host "  [RISK]    $area -- $msg" -ForegroundColor Red
     $script:risk++
-    $script:log += "[RISK]  $area -- $msg"
     $script:findings += [PSCustomObject]@{ Level="RISK"; Area=$area; Message=$msg }
+    $script:log += "[RISK]    $area -- $msg"
+}
+function MISSING ($area, $msg) {
+    Write-Host "  [MISSING] $area -- $msg" -ForegroundColor Magenta
+    $script:missing++
+    $script:findings += [PSCustomObject]@{ Level="MISSING"; Area=$area; Message=$msg }
+    $script:log += "[MISSING] $area -- $msg"
 }
 function HEAD ($msg) {
     Write-Host "`n==> $msg" -ForegroundColor Cyan
@@ -37,578 +44,501 @@ function INFO ($msg) {
     Write-Host "       $msg" -ForegroundColor DarkGray
     $script:log += "       $msg"
 }
-
-# Helper: read file safely
 function ReadFile ($path) {
     if (Test-Path $path) { return Get-Content $path -Raw -ErrorAction SilentlyContinue }
     return ""
 }
-
-# Helper: count pattern occurrences
 function CountMatches ($content, $pattern) {
     return ([regex]::Matches($content, $pattern)).Count
 }
-
-# ============================================================
-HEAD "A. MCP LAYER (mcp.rs + mcp.ts)"
-
-$mcpRs = ReadFile "src-tauri\src\mcp.rs"
-$mcpTs = ReadFile "src\lib\mcp.ts"
-
-# Rust: deadlock fix
-if ($mcpRs -match "guard.*dropped" -or $mcpRs -match "// .* guard") {
-    SOLID "mcp.rs" "Mutex guard scoping comments present -- deadlock fix is documented"
-} else {
-    WEAK "mcp.rs" "No guard scoping comments found -- hard to verify deadlock fix is correct"
+function HttpGet ($url) {
+    try {
+        $r = Invoke-WebRequest -Uri $url -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
+        return $r.StatusCode
+    } catch { return 0 }
 }
-
-# Rust: reader_loop uses global state
-if ($mcpRs -match "ensure_state\(\)" -and $mcpRs -match "reader_loop") {
-    SOLID "mcp.rs" "reader_loop receives ensure_state() -- unexpected disconnects update UI correctly"
-} else {
-    RISK "mcp.rs" "reader_loop may not use global state -- disconnects may be silent"
+function PortOpen ($port) {
+    try {
+        $t = New-Object System.Net.Sockets.TcpClient
+        $a = $t.BeginConnect("127.0.0.1", $port, $null, $null)
+        $ok = $a.AsyncWaitHandle.WaitOne(500, $false)
+        $t.Close()
+        return $ok
+    } catch { return $false }
 }
-
-# Rust: fail_all_pending on EOF
-if ($mcpRs -match "fail_all_pending" -and $mcpRs -match "EOF") {
-    SOLID "mcp.rs" "fail_all_pending called on EOF -- in-flight tool calls fail fast instead of hanging 60s"
-} else {
-    WEAK "mcp.rs" "fail_all_pending may not be called on process exit -- tool calls could hang"
-}
-
-# Rust: timeout values
-if ($mcpRs -match "MCP_TIMEOUT_SECS.*60" -or $mcpRs -match "60.*MCP_TIMEOUT") {
-    WEAK "mcp.rs" "Tool timeout is 60s -- this is high. Consider 30s for better UX on hung tools"
-} else {
-    SOLID "mcp.rs" "Timeout value configured (verify it is 30-45s range)"
-}
-
-# Rust: buffer overflow protection
-if ($mcpRs -match "MAX_BUFFER_SIZE") {
-    SOLID "mcp.rs" "MAX_BUFFER_SIZE guard present -- large MCP responses won't crash the reader"
-} else {
-    RISK "mcp.rs" "No buffer size limit found -- a large MCP response could exhaust memory"
-}
-
-# Rust: single server only
-$mcpConnectCount = CountMatches $mcpRs "fn mcp_connect"
-if ($mcpConnectCount -eq 1) {
-    WEAK "mcp.rs" "Single MCP server only -- can only connect to one server at a time (mcp-hub handles this for now)"
-}
-
-# TS: auto-reconnect
-if ($mcpTs -match "scheduleAutoReconnect" -and $mcpTs -match "exponential") {
-    SOLID "mcp.ts" "Auto-reconnect with exponential backoff implemented"
-} elseif ($mcpTs -match "scheduleAutoReconnect") {
-    SOLID "mcp.ts" "Auto-reconnect implemented"
-} else {
-    RISK "mcp.ts" "No auto-reconnect found -- if mcp-hub crashes, user must reconnect manually"
-}
-
-# TS: getCachedTools
-if ($mcpTs -match "getCachedTools") {
-    SOLID "mcp.ts" "getCachedTools() present -- /tools command reads cache, no round-trip"
-} else {
-    WEAK "mcp.ts" "getCachedTools() missing -- /tools causes unnecessary MCP round-trip"
-}
-
-# TS: store pattern
-if ($mcpTs -match "useSyncExternalStore") {
-    SOLID "mcp.ts" "useSyncExternalStore pattern -- MCP state updates are React-safe and concurrent-mode compatible"
-} else {
-    WEAK "mcp.ts" "Not using useSyncExternalStore -- state updates may cause tearing in React 18"
-}
-
-# ============================================================
-HEAD "B. AGENTIC LOOP (agentic.ts)"
-
-$ag = ReadFile "src\lib\agentic.ts"
-
-# getCachedTools instead of mcpListTools on every call
-if ($ag -match "getCachedTools" -and $ag -match "fallback\|length.*0\|0.*length") {
-    SOLID "agentic.ts" "getCachedTools with fallback -- no MCP round-trip on every agentic request"
-} elseif ($ag -match "await mcpListTools\(\)" -and -not ($ag -match "getCachedTools")) {
-    WEAK "agentic.ts" "mcpListTools() called on every agentic request -- 1-3s delay before planning starts"
-}
-
-# maxSteps
-if ($ag -match "maxSteps.*10" -or $ag -match "10.*maxSteps") {
-    SOLID "agentic.ts" "maxSteps=10 -- sufficient for most multi-file tasks"
-} elseif ($ag -match "maxSteps.*3") {
-    RISK "agentic.ts" "maxSteps=3 -- way too low, breaks on any task needing 4+ steps"
-} else {
-    WEAK "agentic.ts" "maxSteps value unclear -- verify it is 8-12"
-}
-
-# Context trimming
-if ($ag -match "trimContext") {
-    SOLID "agentic.ts" "trimContext() implemented -- context window protected on long tasks"
-    # Check the constants
-    if ($ag -match "MAX_CONTEXT_CHARS.*10.000" -or $ag -match "10_000") {
-        SOLID "agentic.ts" "MAX_CONTEXT_CHARS=10000 -- reasonable cap for 8B models"
-    } else {
-        WEAK "agentic.ts" "MAX_CONTEXT_CHARS value not confirmed -- check it is 8000-12000"
+function FileSizeMB ($path) {
+    if (Test-Path $path) {
+        return [math]::Round((Get-Item $path).Length / 1MB, 1)
     }
-    if ($ag -match "KEEP_LAST_TOOL_RESULTS.*4" -or $ag -match "4.*KEEP_LAST") {
-        SOLID "agentic.ts" "Keeps last 4 tool results -- good balance of memory vs context"
+    return 0
+}
+
+Write-Host ""
+Write-Host "  Atelier NikolAi Desktop -- System Inspection v2" -ForegroundColor White
+Write-Host "  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor DarkGray
+Write-Host ""
+
+# ============================================================
+HEAD "1. RUNTIME TOOLS"
+
+# Node.js
+$nodeVer = & node --version 2>$null
+if ($nodeVer) {
+    $nodeMajor = [int]($nodeVer -replace "v(\d+)\..*",'$1')
+    if ($nodeMajor -ge 18) { SOLID "Node.js" "$nodeVer installed (>=18 required)" }
+    else { RISK "Node.js" "$nodeVer is too old -- Vite 7 requires Node 18+" }
+} else { RISK "Node.js" "Not found -- install from nodejs.org" }
+
+# pnpm / npm
+$pnpmVer = & pnpm --version 2>$null
+if ($pnpmVer) { SOLID "pnpm" "v$pnpmVer installed" }
+else {
+    $npmVer = & npm --version 2>$null
+    if ($npmVer) { WEAK "npm" "v$npmVer (pnpm preferred -- run: npm install -g pnpm)" }
+    else { RISK "npm/pnpm" "Neither found" }
+}
+
+# Rust / cargo
+$rustVer = & rustc --version 2>$null
+if ($rustVer) { SOLID "Rust" "$rustVer" }
+else { RISK "Rust" "Not found -- install from rustup.rs" }
+
+# Tauri CLI
+$tauriVer = & npx @tauri-apps/cli@1.5.9 --version 2>$null
+if ($tauriVer) { SOLID "Tauri CLI" "v$tauriVer (via npx)" }
+else { WEAK "Tauri CLI" "Could not verify -- run: npx @tauri-apps/cli@1.5.9 --version" }
+
+# Git
+$gitVer = & git --version 2>$null
+if ($gitVer) { SOLID "Git" "$gitVer" }
+else { WEAK "Git" "Not found -- source control unavailable" }
+
+# ============================================================
+HEAD "2. OLLAMA (LLM runtime)"
+
+$ollamaRunning = PortOpen 11434
+if ($ollamaRunning) {
+    SOLID "Ollama" "Running on port 11434"
+
+    # Get model list
+    try {
+        $tags = Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags" -TimeoutSec 4 -ErrorAction Stop
+        $models = $tags.models
+        if ($models -and $models.Count -gt 0) {
+            SOLID "Ollama models" "$($models.Count) model(s) installed:"
+            $models | ForEach-Object {
+                $sizeMB = [math]::Round($_.size / 1MB, 0)
+                INFO "  - $($_.name) ($sizeMB MB)"
+            }
+            # Check for vision model
+            $visionModels = $models | Where-Object { $_.name -match "llava|gemma3|moondream|bakllava|minicpm" }
+            if ($visionModels) { SOLID "Vision model" "Found: $($visionModels[0].name) -- image attachments will work" }
+            else { WEAK "Vision model" "None found -- image attachments need llava/gemma3/moondream" }
+
+            # Check for nomic-embed-text (V5 semantic search)
+            $embedModel = $models | Where-Object { $_.name -match "nomic-embed-text|nomic" }
+            if ($embedModel) { SOLID "Embedding model" "Found: $($embedModel[0].name) -- semantic search (V5) will work" }
+            else { MISSING "Embedding model" "nomic-embed-text not installed. Run: ollama pull nomic-embed-text (~274 MB)" }
+        } else {
+            WEAK "Ollama models" "No models installed -- run: ollama pull qwen2.5:7b"
+        }
+    } catch {
+        WEAK "Ollama API" "Running but /api/tags failed -- is it the correct version?"
     }
 } else {
-    RISK "agentic.ts" "No context trimming -- long tasks will overflow model context window silently"
-}
-
-# Batch writes
-if ($ag -match "ws_batch_apply") {
-    SOLID "agentic.ts" "Atomic batch writes via ws_batch_apply -- no more partial file creation"
-    if ($ag -match "rollbackBatch") {
-        SOLID "agentic.ts" "Auto-rollback on batch failure -- filesystem restored to pre-agent state"
-    } else {
-        RISK "agentic.ts" "Batch apply present but no rollback -- failure leaves partial state"
-    }
-} else {
-    RISK "agentic.ts" "No batch writes -- multi-file agent tasks can leave partial state on failure"
-}
-
-# Plan parse retry
-if ($ag -match "MAX_PLAN_PARSE_RETRIES") {
-    SOLID "agentic.ts" "Plan parse retry logic present -- model JSON failures get a second chance"
-} else {
-    WEAK "agentic.ts" "No parse retry -- one bad JSON response from model kills the whole task"
-}
-
-# Error recovery (tool errors fed back)
-if ($ag -match "Choose a different approach") {
-    SOLID "agentic.ts" "Tool errors fed back into conversation -- model can adapt and try alternatives"
-} else {
-    WEAK "agentic.ts" "Tool errors may stop chain silently -- model does not get chance to recover"
-}
-
-# Blocklist vs allowlist
-if ($ag -match "BLOCKED_TOOL_PATTERNS") {
-    SOLID "agentic.ts" "Blocklist approach -- new tools available automatically, only dangerous ones blocked"
-} elseif ($ag -match "isAllowedAgenticTool\|ALLOWED_TOOLS") {
-    WEAK "agentic.ts" "Allowlist approach -- new tools blocked by default, must be manually added"
-}
-
-# Result truncation
-if ($ag -match "MAX_RESULT_CHARS") {
-    SOLID "agentic.ts" "Tool result truncation present -- large file reads won't overflow context"
-    if ($ag -match "6000" -or $ag -match "6_000") {
-        SOLID "agentic.ts" "MAX_RESULT_CHARS=6000 -- good cap per tool result"
-    }
-} else {
-    RISK "agentic.ts" "No result truncation -- reading a large file injects all content into context"
-}
-
-# Human status messages
-if ($ag -match "humanStatus") {
-    SOLID "agentic.ts" "humanStatus() -- spinner shows readable text not raw tool names"
-} else {
-    WEAK "agentic.ts" "No humanStatus() -- spinner shows cryptic tool names to the user"
-}
-
-# Actions summary
-if ($ag -match "Actions taken") {
-    SOLID "agentic.ts" "Actions summary emitted before final answer -- user sees what was done"
-} else {
-    WEAK "agentic.ts" "No actions summary -- user gets answer but cannot see what tools ran"
-}
-
-# Final streaming answer separate from planner
-if ($ag -match "ollamaStreamChat" -and $ag -match "finalSystem") {
-    SOLID "agentic.ts" "Final answer uses streaming + separate system prompt -- responsive and focused"
-} else {
-    WEAK "agentic.ts" "Final answer path unclear -- may be blocking or use planner prompt"
+    RISK "Ollama" "Not running on port 11434 -- start with: ollama serve"
 }
 
 # ============================================================
-HEAD "C. TOOL COMMAND PARSER (toolCmd.ts)"
+HEAD "3. VOICE PACK"
 
-$tc = ReadFile "src\lib\toolCmd.ts"
+# Find app data dir for voice binaries
+$appData = $env:APPDATA
+$voiceDir = "$appData\com.timanou.nikolai\voice"
+INFO "Expected voice directory: $voiceDir"
 
-# TS: discriminated union return type (delivered version)
-if ($tc -match "ok.*true" -and $tc -match "ok.*false" -and $tc -match "ToolCommand") {
-    SOLID "toolCmd.ts" "Discriminated union return type -- parse errors are typed, never reach mcpCallTool"
-} elseif ($tc -match "__parse_error__") {
-    RISK "toolCmd.ts" "Old __parse_error__ sentinel still present -- bad args reach mcpCallTool -- deploy latest toolCmd.ts"
+if (Test-Path $voiceDir) {
+    SOLID "Voice dir" "Exists: $voiceDir"
 } else {
-    WEAK "toolCmd.ts" "Return type unclear -- verify parse errors are caught before tool execution"
+    MISSING "Voice dir" "Not found at $voiceDir -- voice pack not installed yet"
 }
 
-if ($tc -match "Windows path\|forward slash\|backslash") {
-    SOLID "toolCmd.ts" "Windows path tip in error messages -- users get actionable guidance"
-} else {
-    WEAK "toolCmd.ts" "No Windows path guidance in errors -- C:\path errors will confuse users"
-}
+# Whisper server
+$whisperExe = "$voiceDir\whisper-server.exe"
+if (Test-Path $whisperExe) {
+    $sz = FileSizeMB $whisperExe
+    if ($sz -gt 10) { SOLID "whisper-server.exe" "$sz MB -- looks correct" }
+    else { WEAK "whisper-server.exe" "$sz MB -- suspiciously small, may be corrupt" }
+} else { MISSING "whisper-server.exe" "Not found in $voiceDir" }
+
+# Whisper model
+$whisperModel = "$voiceDir\ggml-base.en.bin"
+if (Test-Path $whisperModel) {
+    $sz = FileSizeMB $whisperModel
+    if ($sz -gt 100) { SOLID "ggml-base.en.bin" "$sz MB -- correct size for base-en model" }
+    elseif ($sz -gt 50) { WEAK "ggml-base.en.bin" "$sz MB -- smaller than expected (base ~150 MB)" }
+    else { RISK "ggml-base.en.bin" "$sz MB -- too small, likely corrupt" }
+} else { MISSING "ggml-base.en.bin" "Whisper base-en model not found -- STT will not work" }
+
+# Piper
+$piperExe = "$voiceDir\piper.exe"
+if (Test-Path $piperExe) {
+    $sz = FileSizeMB $piperExe
+    if ($sz -gt 1) { SOLID "piper.exe" "$sz MB -- found" }
+    else { WEAK "piper.exe" "$sz MB -- suspiciously small" }
+} else { MISSING "piper.exe" "Not found -- TTS will not work" }
+
+# Piper model
+$piperModel = "$voiceDir\en_US-lessac-medium.onnx"
+if (Test-Path $piperModel) {
+    $sz = FileSizeMB $piperModel
+    if ($sz -gt 30) { SOLID "en_US-lessac-medium.onnx" "$sz MB -- correct" }
+    else { WEAK "en_US-lessac-medium.onnx" "$sz MB -- may be incomplete" }
+} else { MISSING "en_US-lessac-medium.onnx" "Piper voice model not found" }
+
+# Piper config
+$piperConfig = "$voiceDir\en_US-lessac-medium.onnx.json"
+if (Test-Path $piperConfig) { SOLID "en_US-lessac-medium.onnx.json" "Config file present" }
+else { MISSING "en_US-lessac-medium.onnx.json" "Piper config missing -- TTS will fail even if model is present" }
+
+# Voice servers actually running?
+$whisperPort = PortOpen 9900
+$piperPort   = PortOpen 9860
+if ($whisperPort) { SOLID "Whisper server" "Responding on port 9900 -- ASR ready" }
+else { WEAK "Whisper server" "Not running on 9900 -- use Voice tab -> Start servers" }
+if ($piperPort) { SOLID "Piper server" "Responding on port 9860 -- TTS ready" }
+else { WEAK "Piper server" "Not running on 9860 -- use Voice tab -> Start servers" }
 
 # ============================================================
-HEAD "D. TOOL RESULT FORMATTER (toolResult.ts)"
+HEAD "4. MCP SERVER"
 
-$tr = ReadFile "src\lib\toolResult.ts"
+$mcpConfig = $null
+$mcpRaw = $null
+try {
+    $mcpRaw = localStorage_key = [System.IO.File]::ReadAllText("$env:APPDATA\com.timanou.nikolai\nikolai.mcp.stdio.v1.json") 2>$null
+} catch {}
 
-if ($tr -match "READ_FILE_PREVIEW_LINES") {
-    SOLID "toolResult.ts" "Large file preview truncation -- read_file won't dump 1000 lines into chat"
-    if ($tr -match "200") {
-        SOLID "toolResult.ts" "READ_FILE_PREVIEW_LINES=200 -- reasonable preview size"
-    }
-} else {
-    WEAK "toolResult.ts" "No line preview limit for file reads -- large files will flood the chat"
-}
-
-if ($tr -match "isError") {
-    SOLID "toolResult.ts" "isError flag on FormattedToolResult -- errors are distinguished from content"
-} else {
-    WEAK "toolResult.ts" "No isError distinction -- tool errors look like normal content in chat"
-}
-
-if ($tr -match "formatDirectoryListing") {
-    SOLID "toolResult.ts" "Directory listing formatter -- fs.list_directory shows clean file tree"
-} else {
-    WEAK "toolResult.ts" "No directory listing formatter -- raw JSON arrays shown to user"
-}
-
-if ($tr -match "MAX.*80000\|80_000") {
-    SOLID "toolResult.ts" "80KB hard cap on tool result display -- browser won't freeze on huge outputs"
-} else {
-    WEAK "toolResult.ts" "No hard cap on result size -- very large results could freeze the UI"
-}
+# Check if mcp-hub is running (common port 3000 or check process)
+$mcpHubProcess = Get-Process -Name "node" -ErrorAction SilentlyContinue | Where-Object {
+    $_.CommandLine -match "mcp" -or $_.Path -match "mcp"
+} 2>$null
+if ($mcpHubProcess) { SOLID "mcp-hub process" "Node MCP process detected (PID $($mcpHubProcess[0].Id))" }
+else { WEAK "mcp-hub process" "No MCP node process found -- connect via Tools tab first" }
 
 # ============================================================
-HEAD "E. TOOL LOG (toolLog.ts)"
+HEAD "5. PROJECT STRUCTURE"
 
-$tl = ReadFile "src\lib\toolLog.ts"
+# Required source files
+$requiredFiles = @(
+    "src\App.tsx",
+    "src\components\ChatCenter.tsx",
+    "src\components\ChatHistory.tsx",
+    "src\components\RightPanel.tsx",
+    "src\components\VoicePanel.tsx",
+    "src\components\ToolsPanel.tsx",
+    "src\components\WorkspacePanel.tsx",
+    "src\lib\agentic.ts",
+    "src\lib\mcp.ts",
+    "src\lib\memory.ts",
+    "src\lib\ollamaChat.ts",
+    "src\lib\ollamaStream.ts",
+    "src\lib\semanticIndex.ts",
+    "src\lib\toolResult.ts",
+    "src\lib\toolLog.ts",
+    "src\lib\storage.ts",
+    "src\lib\workspaceClient.ts",
+    "src\lib\voiceSettings.ts",
+    "src\lib\sttClient.ts",
+    "src\lib\ttsClient.ts",
+    "src\types.ts",
+    "src-tauri\src\main.rs",
+    "src-tauri\src\mcp.rs",
+    "src-tauri\src\workspace.rs",
+    "src-tauri\src\voice.rs",
+    "src-tauri\Cargo.toml",
+    "src-tauri\tauri.conf.json"
+)
 
-if ($tl -match "MAX_ITEMS.*120\|120.*MAX_ITEMS") {
-    SOLID "toolLog.ts" "MAX_ITEMS=120 -- log won't grow unbounded"
-} else {
-    WEAK "toolLog.ts" "No MAX_ITEMS limit -- tool log grows forever in localStorage"
+$missing_files = @()
+foreach ($f in $requiredFiles) {
+    if (-not (Test-Path $f)) { $missing_files += $f }
+}
+if ($missing_files.Count -eq 0) { SOLID "Source files" "All $($requiredFiles.Count) required files present" }
+else {
+    RISK "Source files" "$($missing_files.Count) required file(s) missing:"
+    $missing_files | ForEach-Object { INFO "  MISSING: $_" }
 }
 
-if ($tl -match "MAX_TOTAL_CHARS\|200.000\|200_000") {
-    SOLID "toolLog.ts" "Total size cap on localStorage -- quota errors prevented"
-} else {
-    WEAK "toolLog.ts" "No total size cap -- tool log will eventually hit localStorage quota"
-}
+# pdfjs-dist installed?
+$pdfjs = Test-Path "node_modules\pdfjs-dist"
+if ($pdfjs) { SOLID "pdfjs-dist" "Installed -- PDF attachment feature will work" }
+else { MISSING "pdfjs-dist" "Not installed -- run: pnpm add pdfjs-dist" }
 
-if ($tl -match "persistSafe\|QuotaExceeded\|quota") {
-    SOLID "toolLog.ts" "Quota exceeded handling -- graceful degradation when storage is full"
-} else {
-    RISK "toolLog.ts" "No quota exceeded handling -- localStorage full will silently drop all logs -- deploy latest toolLog.ts"
-}
+# diff package (WorkspacePanel diff view)
+$diffPkg = Test-Path "node_modules\diff"
+if ($diffPkg) { SOLID "diff" "Installed -- WorkspacePanel diff view will work" }
+else { MISSING "diff" "Not installed -- run: pnpm add diff" }
 
-# ============================================================
-HEAD "F. APP.TSX -- CHAT ORCHESTRATION"
-
-$app = ReadFile "src\App.tsx"
-
-# Tool timeout
-if ($app -match "TOOL_TIMEOUT_MS.*20000\|20000.*TOOL_TIMEOUT") {
-    SOLID "App.tsx" "TOOL_TIMEOUT_MS=20000 -- 20s ceiling, won't leave user waiting 45s on hung tool"
-} elseif ($app -match "TOOL_TIMEOUT_MS.*45000\|45000.*TOOL_TIMEOUT") {
-    WEAK "App.tsx" "TOOL_TIMEOUT_MS=45000 -- too high, reduce to 20000"
-} else {
-    WEAK "App.tsx" "TOOL_TIMEOUT_MS value unclear -- verify it is 20000-30000"
-}
-
-# Double-fire guard
-if ($app -match "sendingRef") {
-    SOLID "App.tsx" "sendingRef guard present -- double-click / rapid Enter cannot fire two requests"
-} else {
-    WEAK "App.tsx" "No sendingRef guard -- double-click can fire two concurrent requests"
-}
-
-# Auto-title
-if ($app -match "autoTitleChat\|New chat.*title\|title.*New chat") {
-    SOLID "App.tsx" "autoTitleChat present -- chats get meaningful titles from first message"
-} else {
-    WEAK "App.tsx" "No auto-title -- all chats remain 'New chat', unusable after a week of daily use"
-}
-
-# sessionStorage for tool approvals
-if ($app -match "sessionStorage.*tool.allow\|nikolai.tool.allow") {
-    SOLID "App.tsx" "toolAllowInChat persisted to sessionStorage -- approvals survive hot-reload"
-} else {
-    WEAK "App.tsx" "toolAllowInChat is plain state -- all approvals lost on every reload"
-}
-
-# No loadChats() in send hot path
-if ($app -match "updatedChats.find\|currentChat.*updatedChats") {
-    SOLID "App.tsx" "send() uses in-memory state -- no disk read on every message"
-} elseif ($app -match "loadChats\(\).*find") {
-    WEAK "App.tsx" "send() calls loadChats() on every message -- unnecessary localStorage read"
-}
-
-# FIX: Added missing if statement here
-if ($app -match "agentStatus.*React.*state\|setAgentStatus") {
-    SOLID "App.tsx" "agentStatus is React state -- status never written to message content or disk"
-} else {
-    RISK "App.tsx" "__STATUS__: sentinel may still be used -- crashed agent leaves broken messages"
-}
-
-# finally block clears status
-$finallyBlocks = CountMatches $app "finally"
-$clearInFinally = CountMatches $app 'setAgentStatus\("")'
-if ($clearInFinally -ge 2) {
-    SOLID "App.tsx" "setAgentStatus cleared in finally blocks ($clearInFinally times) -- status always clears on stop/error"
-} else {
-    WEAK "App.tsx" "setAgentStatus may not clear in all error paths -- status indicator could get stuck"
-}
-
-# getCachedTools for /tools
-if ($app -match "getCachedTools") {
-    SOLID "App.tsx" "/tools command uses getCachedTools -- instant response, no MCP round-trip"
-} else {
-    WEAK "App.tsx" "/tools still calls mcpListTools -- unnecessary round-trip every time"
-}
-
-# shouldUseAgentic heuristic quality
-if ($app -match "actionVerbs.*fileNouns\|fileNouns.*actionVerbs") {
-    SOLID "App.tsx" "shouldUseAgentic requires verb+noun -- 'what is a file?' stays in plain chat"
-} elseif ($app -match "shouldUseAgentic.*file") {
-    WEAK "App.tsx" "shouldUseAgentic may trigger on keyword 'file' alone -- innocent questions route to agent"
-}
-
-# rAF streaming buffer
-if ($app -match "requestAnimationFrame\|rAF\|scheduleFlush") {
-    SOLID "App.tsx" "rAF-buffered streaming -- tokens batch-rendered, no per-character React re-renders"
-} else {
-    WEAK "App.tsx" "No streaming buffer -- every token causes a React re-render, UI may stutter"
-}
-
-# Abort controller
-if ($app -match "AbortController" -and $app -match "abortRef") {
-    SOLID "App.tsx" "AbortController + ref -- Stop button actually cancels in-flight requests"
-} else {
-    RISK "App.tsx" "No AbortController found -- Stop button may not cancel streaming"
-}
-
-# legacy __STATUS__ cleanup
-if ($app -match "__STATUS__" -and $app -match "clearStatusForActiveChat") {
-    SOLID "App.tsx" "Legacy __STATUS__: cleanup function present -- old saved chats can be cleaned"
-} else {
-    WEAK "App.tsx" "No legacy status cleanup -- old chats may show broken __STATUS__: messages"
-}
-
-# Memory cleanup on unmount
-if ($app -match "cancelAnimationFrame" -and $app -match "useEffect.*return") {
-    SOLID "App.tsx" "rAF cleanup on unmount -- no animation frame leaks"
-} else {
-    WEAK "App.tsx" "No rAF cleanup on unmount -- animation frames may leak if component unmounts"
-}
-
-# Tool approval per-chat allow
-if ($app -match "toolAllowInChat") {
-    SOLID "App.tsx" "Per-chat tool allow list -- approval persists for session without re-prompting"
-} else {
-    WEAK "App.tsx" "No per-chat allow -- user must approve every single tool call"
-}
-
-# ============================================================
-HEAD "G. CHAT CENTER (ChatCenter.tsx)"
-
-$cc = ReadFile "src\components\ChatCenter.tsx"
-
-# Agent status prop (not sentinel)
-if ($cc -match "agentStatus.*Props\|Props.*agentStatus\|agentStatus\?.*string\|agentStatus =") {
-    SOLID "ChatCenter.tsx" "agentStatus is a prop -- floating indicator, never a message in the thread"
-} else {
-    RISK "ChatCenter.tsx" "agentStatus prop missing -- may still render __STATUS__: from message content -- deploy latest ChatCenter.tsx"
-}
-
-# Tool action cards
-if ($cc -match "ToolActionsBlock" -and $cc -match "ToolStepCard") {
-    SOLID "ChatCenter.tsx" "Tool action cards -- agent steps shown as visual cards not raw markdown"
-} else {
-    WEAK "ChatCenter.tsx" "No tool cards -- agent action summary dumped as plain text into message"
-}
-
-# parseAgentMessage
-if ($cc -match "parseAgentMessage") {
-    SOLID "ChatCenter.tsx" "parseAgentMessage() -- Actions taken block parsed out from message content"
-} else {
-    WEAK "ChatCenter.tsx" "No parseAgentMessage -- full raw content including action markers shown to user"
-}
-
-# Legacy status support
-if ($cc -match "isLegacyStatus\|__STATUS__") {
-    SOLID "ChatCenter.tsx" "Legacy __STATUS__: messages handled -- old chats render as spinner not broken text"
-} else {
-    WEAK "ChatCenter.tsx" "No legacy status handling -- old chats with __STATUS__: show raw text"
-}
-
-# Identity guard
-if ($cc -match "guardIdentityDisplay\|i am kimi\|i am claude") {
-    SOLID "ChatCenter.tsx" "Identity guard present -- model won't claim to be Kimi/Claude/ChatGPT"
-} else {
-    WEAK "ChatCenter.tsx" "No identity guard -- local model may respond as Kimi or other AI"
-}
-
-# MCP reconnect in header
-if ($cc -match "reconnectMcp\|mcpDegraded") {
-    SOLID "ChatCenter.tsx" "MCP reconnect button in chat header -- user can recover without going to Settings"
-} else {
-    WEAK "ChatCenter.tsx" "No reconnect button in chat -- user must navigate to Settings tab to reconnect"
-}
-
-# Auto-scroll
-if ($cc -match "scrollIntoView") {
-    SOLID "ChatCenter.tsx" "Auto-scroll on new messages -- chat follows latest content"
-} else {
-    WEAK "ChatCenter.tsx" "No auto-scroll -- new messages appear off-screen"
-}
-
-# Export
-if ($cc -match "downloadMarkdown\|Export") {
-    SOLID "ChatCenter.tsx" "Markdown export button -- chat history can be saved"
-} else {
-    WEAK "ChatCenter.tsx" "No export -- chat history cannot be saved from the UI"
-}
-
-# ============================================================
-HEAD "H. TOOL APPROVAL MODAL (ToolApprovalModal.tsx)"
-
-$ta = ReadFile "src\components\ToolApprovalModal.tsx"
-
-if ($ta -match "serverFromTool\|bareToolName") {
-    SOLID "ToolApprovalModal.tsx" "Server label derived from tool name -- modal shows context not just raw name"
-} else {
-    WEAK "ToolApprovalModal.tsx" "No server label -- modal shows raw tool name without context"
-}
-
-if ($ta -match "argsExpanded\|setArgsExpanded") {
-    SOLID "ToolApprovalModal.tsx" "Collapsible args panel -- args don't dominate the modal"
-} else {
-    WEAK "ToolApprovalModal.tsx" "No collapsible args -- large arg objects take over the modal"
-}
-
-if ($ta -match "onDeny.*onAllowOnce.*onAllowChat\|Deny.*Allow once.*Allow in this chat") {
-    SOLID "ToolApprovalModal.tsx" "Three-option approval -- Deny / Once / Chat gives proper granularity"
-} else {
-    WEAK "ToolApprovalModal.tsx" "Missing approval options -- user has insufficient control"
-}
-
-# ============================================================
-HEAD "I. WORKSPACE (workspace.rs)"
-
-$ws = ReadFile "src-tauri\src\workspace.rs"
-
-if ($ws -match "ws_batch_apply" -and $ws -match "ws_batch_rollback") {
-    SOLID "workspace.rs" "Batch apply + rollback both present -- atomic multi-file operations supported"
-} else {
-    RISK "workspace.rs" "Batch apply or rollback missing -- multi-file operations are not atomic"
-}
-
-if ($ws -match "sanitize_rel\|ParentDir.*not allowed\|\.\. not allowed") {
-    SOLID "workspace.rs" "Path traversal protection -- '..' in paths is blocked"
-} else {
-    RISK "workspace.rs" "No path traversal check -- agent could write outside workspace root"
-}
-
-if ($ws -match "manifest\.jsonl\|write_manifest") {
-    SOLID "workspace.rs" "Audit manifest (manifest.jsonl) -- every write is logged for recovery"
-} else {
-    WEAK "workspace.rs" "No audit manifest -- no record of what was written for recovery"
-}
-
-if ($ws -match "max.*200\|200.*max\|too many files") {
-    SOLID "workspace.rs" "Batch file limit (200) -- agent cannot write unbounded files in one call"
-} else {
-    WEAK "workspace.rs" "No batch size limit -- agent could theoretically write thousands of files"
-}
-
-if ($ws -match "\.nikolai_backups") {
-    SOLID "workspace.rs" "Backups stored in .nikolai_backups -- originals preserved before any overwrite"
-} else {
-    WEAK "workspace.rs" "No backup directory pattern found -- overwrites may not be recoverable"
-}
-
-# ============================================================
-HEAD "J. TAURI VERSION AND BUILD"
-
+# lazy_static in Cargo.toml
 $cargoToml = ReadFile "src-tauri\Cargo.toml"
+if ($cargoToml -match "lazy_static") { SOLID "Cargo.toml" "lazy_static dependency present -- voice.rs will compile" }
+else { RISK "Cargo.toml" "lazy_static missing -- voice.rs will NOT compile. Add: lazy_static = '1'" }
 
-# Tauri version
-if ($cargoToml -match "tauri.*=.*1\." -or $cargoToml -match '"1\.') {
-    WEAK "Cargo.toml" "Using Tauri v1 -- Tauri v2 is stable and has better security model. Not urgent for v1 but worth planning"
+# package.json version
+$pkg = ReadFile "package.json"
+if ($pkg -match '"version"\s*:\s*"([^"]+)"') {
+    INFO "Frontend version: $($Matches[1])"
 }
 
-# Icons
-if (Test-Path "src-tauri\icons") {
-    $iconCount = (Get-ChildItem "src-tauri\icons" -ErrorAction SilentlyContinue).Count
-    if ($iconCount -ge 5) { SOLID "icons" "$iconCount icon files present -- all platform sizes covered" }
-    else { WEAK "icons" "Only $iconCount icon files -- some platform sizes may be missing" }
-} else {
-    WEAK "icons" "No icons folder -- app will use default Tauri icon"
-}
-
-# dist has content
-if (Test-Path "dist") {
-    $distFiles = (Get-ChildItem "dist" -Recurse -ErrorAction SilentlyContinue).Count
-    if ($distFiles -lt 3) {
-        WEAK "dist" "dist has only $distFiles files -- may be stale. Run pnpm build before tauri build"
-    } else {
-        SOLID "dist" "dist has $distFiles files -- frontend build looks complete"
-    }
-}
-
-# node_modules count (pnpm uses virtual store)
-if (Test-Path "node_modules") {
-    $nmDirs = (Get-ChildItem "node_modules" -Directory -ErrorAction SilentlyContinue).Count
-    if ($nmDirs -lt 50 -and (Test-Path "node_modules\.pnpm")) {
-        SOLID "node_modules" "pnpm virtual store detected ($nmDirs top-level dirs) -- this is normal for pnpm"
-    } elseif ($nmDirs -lt 10) {
-        WEAK "node_modules" "Only $nmDirs dirs in node_modules -- may be incomplete, run: pnpm install"
+# Cargo.toml tauri version
+if ($cargoToml -match 'tauri\s*=.*"([12]\.[^"]+)"') {
+    INFO "Tauri version in Cargo.toml: $($Matches[1])"
+    if ($Matches[1] -match "^1\.") {
+        WEAK "Tauri version" "Using Tauri v1 -- works fine, v2 migration is a future consideration"
     }
 }
 
 # ============================================================
-HEAD "K. WHAT IS MISSING vs CLAUDE DESKTOP"
+HEAD "6. V4 FEATURES CHECK"
 
-INFO "The following are gaps vs Claude Desktop or known improvement areas."
-INFO "These are not bugs -- they are the next feature layer."
-INFO ""
+$ag  = ReadFile "src\lib\agentic.ts"
+$cc  = ReadFile "src\components\ChatCenter.tsx"
+$rp  = ReadFile "src\components\RightPanel.tsx"
+$mem = ReadFile "src\lib\memory.ts"
+$vr  = ReadFile "src-tauri\src\voice.rs"
 
-WEAK "multi-server MCP" "Only 1 MCP server at a time. Claude Desktop supports 10+. Needs mcp.rs rewrite with server map."
-WEAK "tool streaming" "Tool results block until complete. Claude Desktop shows progressive output. Needs Tauri event channel."
-WEAK "Tauri v1" "Using Tauri 1.5.9. v2 has better IPC security, permissions model, and mobile support."
-WEAK "no prompt caching" "Planner system prompt + tool catalog rebuilt on every step. Could cache hash and skip rebuild."
-WEAK "no conversation search" "No way to search across all chats. Growing chat list becomes hard to navigate."
-WEAK "single provider at once" "Only one AI provider active at a time. No fallback if primary is unavailable."
-WEAK "no model benchmarking" "No way to test which local model performs best at planning for your tasks."
+# Memory
+if ($mem -match "loadMemory" -and $mem -match "addFact" -and $mem -match "formatMemoryForPrompt") {
+    SOLID "V4-C Memory" "memory.ts complete -- loadMemory, addFact, formatMemoryForPrompt all present"
+} else { MISSING "V4-C Memory" "memory.ts incomplete or missing" }
+
+if ($rp -match "MemoryPanel" -and $rp -match "memory") {
+    SOLID "V4-C Memory UI" "Memory tab present in RightPanel" }
+else { MISSING "V4-C Memory UI" "Memory tab missing from RightPanel" }
+
+if ($ag -match "loadMemory" -and $ag -match "memoryText") {
+    SOLID "V4-C Memory injection" "agentic.ts injects memory into planner prompt" }
+else { MISSING "V4-C Memory injection" "agentic.ts does not inject memory into planner" }
+
+# Context grounding
+if ($ag -match "silentTool" -and $ag -match "Context grounding") {
+    SOLID "V4-B Context grounding" "Auto-reads project structure before agentic loop" }
+else { MISSING "V4-B Context grounding" "Context grounding not present in agentic.ts" }
+
+# PDF support
+if ($cc -match "extractPdfText" -and $cc -match "pdfjs") {
+    SOLID "V4-A PDF" "PDF extraction present in ChatCenter" }
+else { MISSING "V4-A PDF" "PDF support missing from ChatCenter" }
+
+if ($cc -match "pdfInputRef" -and $cc -match "pendingPdfs") {
+    SOLID "V4-A PDF UI" "PDF input ref and pendingPdfs state present" }
+else { MISSING "V4-A PDF UI" "PDF UI elements missing" }
+
+# Voice sidecar
+if ($vr -match "voice_status" -and $vr -match "voice_start_servers") {
+    SOLID "V4 Voice sidecar" "voice.rs commands present -- auto-launch logic ready" }
+else { MISSING "V4 Voice sidecar" "voice.rs missing or incomplete" }
+
+$mainRs = ReadFile "src-tauri\src\main.rs"
+if ($mainRs -match "voice::voice_status" -and $mainRs -match "mod voice") {
+    SOLID "V4 Voice in main.rs" "voice module registered in main.rs" }
+else { MISSING "V4 Voice in main.rs" "voice module not registered -- Tauri commands won't work" }
+
+# System prompt
+if ($cc -match "systemPromptOpen" -and $cc -match "onUpdateSystemPrompt") {
+    SOLID "V3 System prompt" "Per-chat system prompt UI present" }
+else { WEAK "V3 System prompt" "System prompt feature missing" }
+
+# Image attachments
+if ($cc -match "pendingImages" -and $cc -match "fileToBase64") {
+    SOLID "V3 Image attachments" "Image paste/drag/paperclip all present" }
+else { WEAK "V3 Image attachments" "Image attachment feature missing" }
+
+# Context meter
+if ($cc -match "estimatedTokens" -and $cc -match "ctxColor") {
+    SOLID "V3 Context meter" "Live token estimate in header" }
+else { WEAK "V3 Context meter" "Context meter missing" }
 
 # ============================================================
-HEAD "L. SUMMARY AND VERDICT"
+HEAD "7. CODE HEALTH SPOT CHECK"
 
-$total = $script:solid + $script:weak + $script:risk
-Write-Host ""
-Write-Host "  SOLID (production-ready) : $($script:solid) / $total" -ForegroundColor Green
-Write-Host "  WEAK  (improvable)       : $($script:weak) / $total" -ForegroundColor Yellow
-Write-Host "  RISK  (should fix)       : $($script:risk) / $total" -ForegroundColor Red
-Write-Host ""
+# agentic.ts core features
+if ($ag -match "trimContext") { SOLID "agentic.ts" "Context window trimming present" }
+else { RISK "agentic.ts" "No context trimming -- long tasks overflow model context" }
 
-Write-Host "  RISK ITEMS (fix before daily use):" -ForegroundColor Red
-$script:findings | Where-Object { $_.Level -eq "RISK" } | ForEach-Object {
-    Write-Host "    - $($_.Area): $($_.Message)" -ForegroundColor Red
+if ($ag -match "ws_batch_apply" -and $ag -match "rollbackBatch") { SOLID "agentic.ts" "Atomic batch writes + rollback" }
+else { RISK "agentic.ts" "Batch write or rollback missing" }
+
+if ($ag -match "MAX_PLAN_PARSE_RETRIES") { SOLID "agentic.ts" "Plan parse retry present" }
+else { WEAK "agentic.ts" "No plan parse retry" }
+
+# workspace.rs safety
+$ws = ReadFile "src-tauri\src\workspace.rs"
+if ($ws -match "sanitize_rel") { SOLID "workspace.rs" "Path traversal protection present" }
+else { RISK "workspace.rs" "No path traversal check -- SECURITY RISK" }
+
+if ($ws -match "\.nikolai_backups") { SOLID "workspace.rs" "Backup before overwrite present" }
+else { WEAK "workspace.rs" "No backup mechanism found" }
+
+# mcp.rs health
+$mcpRs = ReadFile "src-tauri\src\mcp.rs"
+if ($mcpRs -match "fail_all_pending") { SOLID "mcp.rs" "fail_all_pending on disconnect -- no hanging tool calls" }
+else { WEAK "mcp.rs" "No fail_all_pending -- tool calls may hang on disconnect" }
+
+# mcp.ts reconnect
+$mcpTs = ReadFile "src\lib\mcp.ts"
+if ($mcpTs -match "scheduleAutoReconnect\|autoReconnect") { SOLID "mcp.ts" "Auto-reconnect present" }
+else { WEAK "mcp.ts" "No auto-reconnect" }
+
+# ============================================================
+HEAD "8. DISK SPACE"
+
+$drive = Split-Path -Qualifier (Resolve-Path ".").Path
+$disk = Get-PSDrive ($drive -replace ":","") -ErrorAction SilentlyContinue
+if ($disk) {
+    $freeGB = [math]::Round($disk.Free / 1GB, 1)
+    INFO "Free space on $drive $freeGB GB"
+    if ($freeGB -lt 5) { RISK "Disk space" "Less than 5 GB free -- builds and models may fail" }
+    elseif ($freeGB -lt 20) { WEAK "Disk space" "${freeGB}GB free -- enough for now but models will fill this fast" }
+    else { SOLID "Disk space" "${freeGB}GB free -- plenty of room" }
 }
 
-Write-Host ""
-Write-Host "  TOP 5 WEAK ITEMS TO IMPROVE NEXT:" -ForegroundColor Yellow
-$script:findings | Where-Object { $_.Level -eq "WEAK" -and $_.Area -notmatch "Claude Desktop|multi-server|streaming|Tauri v1|caching|search|provider|benchmark" } | Select-Object -First 5 | ForEach-Object {
-    Write-Host "    - $($_.Area): $($_.Message)" -ForegroundColor Yellow
+# Ollama model storage size
+$ollamaDir = "$env:USERPROFILE\.ollama\models"
+if (Test-Path $ollamaDir) {
+    $ollamaGB = [math]::Round((Get-ChildItem $ollamaDir -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1GB, 1)
+    INFO "Ollama models on disk: ${ollamaGB}GB ($ollamaDir)"
 }
 
-Write-Host ""
-if ($script:risk -eq 0) {
-    Write-Host "  VERDICT: No critical risks found. Safe for daily use as v1." -ForegroundColor Green
-    Write-Host "  Build:   npm run tauri build" -ForegroundColor Cyan
-} elseif ($script:risk -le 2) {
-    Write-Host "  VERDICT: $($script:risk) risk item(s) found. Review before building." -ForegroundColor Yellow
+# ============================================================
+HEAD "9. V5 SEMANTIC INDEX"
+
+INFO "Checking V5 semantic search files..."
+
+# semanticIndex.ts
+$semTs = ReadFile "src\lib\semanticIndex.ts"
+if ($semTs -match "buildIndex" -and $semTs -match "searchIndex" -and $semTs -match "embedText") {
+    SOLID "semanticIndex.ts" "All core functions present: buildIndex, searchIndex, embedText"
+} elseif ($semTs) {
+    WEAK "semanticIndex.ts" "File exists but missing some functions -- redeploy semanticIndex.ts"
 } else {
-    Write-Host "  VERDICT: $($script:risk) risk items. Address before daily use." -ForegroundColor Red
+    MISSING "semanticIndex.ts" "NOT FOUND -- deploy src/lib/semanticIndex.ts"
 }
 
-# Save full report
-$logFile = "nikolai-inspect-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log"
+if ($semTs -match "cosine\|cosineSimilarity") { SOLID "semanticIndex.ts" "Cosine similarity math present" }
+elseif ($semTs) { RISK "semanticIndex.ts" "No cosine similarity function -- search results will be wrong" }
+
+if ($semTs -match "QuotaExceededError") { SOLID "semanticIndex.ts" "localStorage quota guard present -- won't crash on large projects" }
+elseif ($semTs) { WEAK "semanticIndex.ts" "No quota guard -- may crash silently on very large codebases" }
+
+if ($semTs -match "SKIP_DIRS\|node_modules.*git") { SOLID "semanticIndex.ts" "SKIP_DIRS filter present -- won't embed node_modules or .git" }
+elseif ($semTs) { RISK "semanticIndex.ts" "No SKIP_DIRS -- will try to embed node_modules (millions of files)" }
+
+# agentic.ts V5 wiring
+$agV5 = ReadFile "src\lib\agentic.ts"
+if ($agV5 -match "semantic\.find" -and $agV5 -match "semanticExecutor") {
+    SOLID "agentic.ts (V5)" "semantic.find tool wired into agent loop via semanticExecutor"
+} else {
+    MISSING "agentic.ts (V5)" "semantic.find not wired -- redeploy agentic.ts V5"
+}
+
+if ($agV5 -match "hasSemanticIndex" -and $agV5 -match "loadIndex") {
+    SOLID "agentic.ts (V5)" "Index loaded and hasSemanticIndex flag checked before each run"
+} else {
+    MISSING "agentic.ts (V5)" "hasSemanticIndex/loadIndex missing from agentic.ts"
+}
+
+if ($agV5 -match "isSynthetic") {
+    SOLID "agentic.ts (V5)" "Synthetic tool bypass present -- semantic.find skips MCP tool-not-found check"
+} else {
+    RISK "agentic.ts (V5)" "No isSynthetic bypass -- semantic.find will be blocked as 'tool not found'"
+}
+
+if ($agV5 -match "from.*semanticIndex") { SOLID "agentic.ts (V5)" "semanticIndex imported correctly" }
+else { MISSING "agentic.ts (V5)" "semanticIndex not imported in agentic.ts" }
+
+# WorkspacePanel V5 UI
+$wpV5 = ReadFile "src\components\WorkspacePanel.tsx"
+if ($wpV5 -match "startBuildIndex\|buildIndex" -and $wpV5 -match "Semantic Index") {
+    SOLID "WorkspacePanel (V5)" "Build Index UI present"
+} else {
+    MISSING "WorkspacePanel (V5)" "No index build UI -- redeploy WorkspacePanel.tsx V5"
+}
+
+if ($wpV5 -match "indexProgress") { SOLID "WorkspacePanel (V5)" "Progress indicator state present" }
+else { WEAK "WorkspacePanel (V5)" "No progress indicator -- user won't see build status" }
+
+if ($wpV5 -match "AbortController\|abortBuildIndex") { SOLID "WorkspacePanel (V5)" "Index build can be cancelled mid-way" }
+else { WEAK "WorkspacePanel (V5)" "No cancel support -- user stuck waiting if build hangs" }
+
+# Check nomic-embed-text is pulled in Ollama
+if ($ollamaRunning) {
+    try {
+        $tagsJson = Invoke-RestMethod -Uri "http://127.0.0.1:11434/api/tags" -TimeoutSec 4 -ErrorAction Stop
+        $nomicPulled = $tagsJson.models | Where-Object { $_.name -match "nomic-embed-text" }
+        if ($nomicPulled) {
+            $nomicSize = [math]::Round($nomicPulled[0].size / 1MB, 0)
+            SOLID "nomic-embed-text" "Pulled and ready ($nomicSize MB) -- semantic index can be built immediately"
+        } else {
+            MISSING "nomic-embed-text" "Not pulled yet. Run: ollama pull nomic-embed-text (~274 MB) then click Build Index in Workspace tab"
+        }
+    } catch {
+        WEAK "nomic-embed-text" "Could not check Ollama model list"
+    }
+} else {
+    WEAK "nomic-embed-text" "Ollama not running -- cannot check if nomic-embed-text is pulled"
+}
+
+# ============================================================
+HEAD "10. SUMMARY"
+
+$total = $script:solid + $script:weak + $script:risk + $script:missing
+
+Write-Host ""
+Write-Host "  SOLID   (working correctly)  : $($script:solid)"  -ForegroundColor Green
+Write-Host "  WEAK    (works, improvable)  : $($script:weak)"   -ForegroundColor Yellow
+Write-Host "  MISSING (V4 feature gap)     : $($script:missing)" -ForegroundColor Magenta
+Write-Host "  RISK    (should fix now)     : $($script:risk)"   -ForegroundColor Red
+Write-Host "  TOTAL checks                 : $total"
+Write-Host ""
+
+if ($script:risk -gt 0) {
+    Write-Host "  RISK ITEMS -- fix before daily use:" -ForegroundColor Red
+    $script:findings | Where-Object { $_.Level -eq "RISK" } | ForEach-Object {
+        Write-Host "    ! $($_.Area): $($_.Message)" -ForegroundColor Red
+    }
+    Write-Host ""
+}
+
+if ($script:missing -gt 0) {
+    Write-Host "  MISSING V4 FEATURES -- deploy output files to fix:" -ForegroundColor Magenta
+    $script:findings | Where-Object { $_.Level -eq "MISSING" } | ForEach-Object {
+        Write-Host "    * $($_.Area): $($_.Message)" -ForegroundColor Magenta
+    }
+    Write-Host ""
+}
+
+# Overall verdict
+$voiceReady = (Test-Path $whisperExe) -and (Test-Path $whisperModel) -and (Test-Path $piperExe) -and (Test-Path $piperModel) -and (Test-Path $piperConfig)
+$v4Ready    = ($ag -match "loadMemory") -and ($cc -match "extractPdfText") -and ($vr -match "voice_start_servers")
+$v5Ready    = ($semTs -match "buildIndex") -and ($agV5 -match "semanticExecutor") -and ($wpV5 -match "startBuildIndex")
+
+Write-Host "  VOICE PACK:  $(if ($voiceReady) { 'READY' } else { 'NOT READY -- see MISSING items above' })" -ForegroundColor $(if ($voiceReady) { 'Green' } else { 'Magenta' })
+Write-Host "  V4 FEATURES: $(if ($v4Ready) { 'DEPLOYED' } else { 'PARTIALLY DEPLOYED -- see MISSING items' })" -ForegroundColor $(if ($v4Ready) { 'Green' } else { 'Yellow' })
+Write-Host "  V5 SEMANTIC: $(if ($v5Ready) { 'DEPLOYED' } else { 'NOT DEPLOYED -- deploy 3 files + ollama pull nomic-embed-text' })" -ForegroundColor $(if ($v5Ready) { 'Green' } else { 'Yellow' })
+Write-Host "  OLLAMA:      $(if ($ollamaRunning) { 'RUNNING' } else { 'NOT RUNNING -- start: ollama serve' })" -ForegroundColor $(if ($ollamaRunning) { 'Green' } else { 'Red' })
+
+Write-Host ""
+if ($script:risk -eq 0 -and $script:missing -eq 0) {
+    Write-Host "  VERDICT: System fully operational. Safe for daily use and tauri build." -ForegroundColor Green
+} elseif ($script:risk -eq 0) {
+    Write-Host "  VERDICT: Core is healthy. Deploy missing V4 files then re-run inspect." -ForegroundColor Yellow
+} else {
+    Write-Host "  VERDICT: $($script:risk) risk item(s) need attention before building." -ForegroundColor Red
+}
+
+# Save report
+$logFile = "nikolai-inspect-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 $script:log | Out-File $logFile -Encoding UTF8
-Write-Host ""
-Write-Host "  Full report saved: $logFile" -ForegroundColor DarkGray
+Write-Host "  Report saved: $logFile" -ForegroundColor DarkGray
 Write-Host ""

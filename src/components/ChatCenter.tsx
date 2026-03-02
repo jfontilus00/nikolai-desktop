@@ -86,7 +86,43 @@ async function extractImagesFromDataTransfer(dt: DataTransfer): Promise<string[]
   return results;
 }
 
-// ✅ FIX (minimal): missing function wrapper caused "Unexpected token"
+// ── V4-A: PDF text extraction ─────────────────────────────────────────────────
+// Uses pdfjs-dist (lazy dynamic import — only loaded when a PDF is dropped).
+// Run: npm install pdfjs-dist   (one-time, in the project root)
+//
+// Extracted text is injected as a fenced block at the top of the user message
+// so any model (including non-vision) can read and reason about the document.
+
+type PendingPdf = { name: string; text: string; pages: number };
+
+async function extractPdfText(file: File): Promise<PendingPdf> {
+  const pdfjs = await import("pdfjs-dist");
+  // Standard Vite worker reference — avoids ?url query that breaks Babel
+  pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+    "pdfjs-dist/build/pdf.worker.min.js",
+    import.meta.url
+  ).href;
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
+  const pages: string[] = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    const pageText = (content.items as any[])
+      .map((item: any) => ("str" in item ? item.str : ""))
+      .join(" ").replace(/\s+/g, " ").trim();
+    if (pageText) pages.push(`--- Page ${i} ---\n${pageText}`);
+  }
+  return { name: file.name, text: pages.join("\n\n"), pages: pdf.numPages };
+}
+
+function formatPdfBlock(pdf: PendingPdf): string {
+  const preview = pdf.text.length > 8000
+    ? pdf.text.slice(0, 8000) + `\n\n[… truncated — ${pdf.text.length - 8000} more chars]`
+    : pdf.text;
+  return `[PDF: ${pdf.name} (${pdf.pages}p)]\n\`\`\`text\n${preview}\n\`\`\`\n\n`;
+}
+
 function downloadMarkdown(filename: string, content: string) {
   const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -284,12 +320,12 @@ function ToolStepCard({ step }: { step: ActionStep }) {
           : "bg-red-950/20 border-red-800/25"
       }`}
     >
-      {/* ── Header row ─────────────────────────────────────────────────────── */ }
+      {/* ── Header row ─────────────────────────────────────────────────────── */}
       <div
         className={`flex items-center gap-2 px-3 py-2 ${hasContent ? "cursor-pointer hover:bg-white/5" : ""}`}
         onClick={() => hasContent && setExpanded((v) => !v)}
       >
-        {/* Diamond icon */ }
+        {/* Diamond icon */}
         <svg width="11" height="11" viewBox="0 0 14 14" className="flex-shrink-0 text-indigo-400/80" fill="currentColor">
           <path d="M7 0L9.5 4.5L14 7L9.5 9.5L7 14L4.5 9.5L0 7L4.5 4.5L7 0Z" />
         </svg>
@@ -306,14 +342,14 @@ function ToolStepCard({ step }: { step: ActionStep }) {
           {step.server}
         </span>
 
-        {/* File path hint — shows next to server label when we have metadata */ }
+        {/* File path hint — shows next to server label when we have metadata */}
         {step.filePath && !expanded && (
           <span className="text-[10px] text-white/30 font-mono truncate max-w-[140px]" title={step.filePath}>
             {step.filePath.split("/").pop()}
           </span>
         )}
 
-        {/* Status badge */ }
+        {/* Status badge */}
         <span className={`ml-auto flex-shrink-0 flex items-center gap-1 font-medium ${step.ok ? "text-emerald-400/80" : "text-red-400/80"}`}>
           {step.ok ? (
             <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
@@ -339,11 +375,11 @@ function ToolStepCard({ step }: { step: ActionStep }) {
         )}
       </div>
 
-      {/* ── Expanded detail ─────────────────────────────────────────────────── */ }
+      {/* ── Expanded detail ─────────────────────────────────────────────────── */}
       {expanded && hasContent && (
         <div className="border-t border-white/6">
 
-          {/* File content preview — the key new feature: see what was actually written */ }
+          {/* File content preview — the key new feature: see what was actually written */}
           {step.contentPreview && (
             <div className="p-2.5">
               <div className="flex items-center justify-between mb-1.5 px-0.5">
@@ -379,7 +415,7 @@ function ToolStepCard({ step }: { step: ActionStep }) {
             </div>
           )}
 
-          {/* Batch commit — list of written files */ }
+          {/* Batch commit — list of written files */}
           {step.files && step.files.length > 0 && (
             <div className="px-3 py-2.5">
               <div className="text-[10px] text-white/35 uppercase tracking-widest mb-1.5">Files written</div>
@@ -394,7 +430,7 @@ function ToolStepCard({ step }: { step: ActionStep }) {
             </div>
           )}
 
-          {/* Plain summary detail (no content preview available) */ }
+          {/* Plain summary detail (no content preview available) */}
           {!step.contentPreview && !(step.files && step.files.length > 0) && (
             <div className="px-3 py-2.5">
               <p className="text-[11px] text-white/50 leading-relaxed">{step.summary}</p>
@@ -413,7 +449,7 @@ function ToolActionsBlock({ steps }: { steps: ActionStep[] }) {
 
   return (
     <div className="mb-3">
-      {/* Header row */ }
+      {/* Header row */}
       <button
         className="flex items-center gap-1.5 text-[11px] text-white/35 hover:text-white/55 mb-2 transition-colors"
         onClick={() => setCollapsed((v) => !v)}
@@ -462,6 +498,11 @@ export default function ChatCenter({
   // pendingImages: base64 strings (no data: prefix — Ollama wants raw base64)
   const [pendingImages, setPendingImages] = useState<string[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // ── V4-A: PDF attachments ───────────────────────────────────────────────────
+  const [pendingPdfs, setPendingPdfs] = useState<PendingPdf[]>([]);
+  const [pdfLoading, setPdfLoading] = useState(false);
+  const pdfInputRef = useRef<HTMLInputElement | null>(null);
 
   // ── V3: System prompt editor ────────────────────────────────────────────────
   const [systemPromptOpen, setSystemPromptOpen] = useState(false);
@@ -564,11 +605,11 @@ export default function ChatCenter({
 
   return (
     <div className="h-full flex flex-col">
-      {/* ── Header ── */ }
+      {/* ── Header ── */}
       <div className="h-12 flex items-center justify-between px-4 border-b border-white/10">
         <div className="flex items-center gap-2">
           <div className="font-semibold truncate max-w-[240px]">{chat.title}</div>
-          {/* System prompt gear */ }
+          {/* System prompt gear */}
           <button
             type="button"
             title="Edit system prompt for this chat"
@@ -583,7 +624,7 @@ export default function ChatCenter({
           </button>
         </div>
         <div className="text-xs flex items-center gap-2">
-          {/* Context meter */ }
+          {/* Context meter */}
           <span className={`font-mono text-[10px] ${ctxColor}`} title="Estimated context tokens (chars÷4)">
             ~{estimatedTokens > 1000 ? `${(estimatedTokens / 1000).toFixed(1)}k` : estimatedTokens}t
           </span>
@@ -634,7 +675,7 @@ export default function ChatCenter({
         </div>
       </div>
 
-      {/* ── System prompt editor (collapsible) ── */ }
+      {/* ── System prompt editor (collapsible) ── */}
       {systemPromptOpen && (
         <div className="border-b border-white/10 bg-white/[0.02] px-4 py-3 space-y-2">
           <div className="text-[11px] text-white/50 font-medium uppercase tracking-widest">
@@ -681,7 +722,7 @@ export default function ChatCenter({
         </div>
       )}
 
-      {/* ── Messages ── */ }
+      {/* ── Messages ── */}
       <div className="flex-1 overflow-auto p-4 space-y-6">
         {chat.messages.map((m, idx) => (
           <MessageBubble
@@ -695,7 +736,7 @@ export default function ChatCenter({
         <div ref={endRef} />
       </div>
 
-      {/* ── Priority 4: Floating agent status + live tool progress ── */ }
+      {/* ── Priority 4: Floating agent status + live tool progress ── */}
       {(agentStatus || liveToolName) && isStreaming && (
         <div className="mx-3 mb-1 px-3 py-2 rounded-lg bg-white/5 border border-white/10 space-y-1.5">
           {agentStatus && (
@@ -706,7 +747,7 @@ export default function ChatCenter({
           )}
           {liveToolName && (
             <div className="flex items-center gap-2.5">
-              {/* Pulsing dot — distinct from the planning spinner above */ }
+              {/* Pulsing dot — distinct from the planning spinner above */}
               <span className="h-2 w-2 flex-shrink-0 rounded-full bg-indigo-400/70 animate-pulse" />
               <span className="text-[11px] text-white/50 leading-snug font-mono truncate">
                 {liveToolName}
@@ -716,10 +757,30 @@ export default function ChatCenter({
         </div>
       )}
 
-      {/* ── Input ── */ }
+      {/* ── Input ── */}
       <div className="border-t border-white/10 p-3 space-y-2">
 
-        {/* ── Pending image thumbnails ── */ }
+        {/* ── Pending PDF pills ── */}
+        {pendingPdfs.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {pendingPdfs.map((pdf, i) => (
+              <div key={i} className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-amber-400/25 bg-amber-500/10 text-[11px]">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-amber-400/70 flex-shrink-0">
+                  <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/>
+                </svg>
+                <span className="text-amber-200/80 truncate max-w-[120px]">{pdf.name}</span>
+                <span className="text-amber-400/50">{pdf.pages}p</span>
+                <button
+                  type="button"
+                  className="text-amber-400/60 hover:text-red-400/80 ml-0.5"
+                  onClick={() => setPendingPdfs((prev) => prev.filter((_, j) => j !== i))}
+                >×</button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* ── Pending image thumbnails ── */}
         {pendingImages.length > 0 && (
           <div className="flex flex-wrap gap-2">
             {pendingImages.map((b64, i) => (
@@ -734,16 +795,14 @@ export default function ChatCenter({
                   className="absolute -top-1.5 -right-1.5 h-4 w-4 rounded-full bg-black/80 border border-white/20 text-[9px] text-white/80 flex items-center justify-center hover:bg-red-900/80 transition-colors"
                   onClick={() => setPendingImages((prev) => prev.filter((_, j) => j !== i))}
                   title="Remove image"
-                >
-                  ×
-                </button>
+                >×</button>
               </div>
             ))}
           </div>
         )}
 
         <div className="flex gap-2">
-          {/* Hidden file input */ }
+          {/* Hidden image file input */}
           <input
             ref={fileInputRef}
             type="file"
@@ -758,7 +817,30 @@ export default function ChatCenter({
             }}
           />
 
-          {/* Paperclip button */ }
+          {/* Hidden PDF file input */}
+          <input
+            ref={pdfInputRef}
+            type="file"
+            accept="application/pdf,.pdf"
+            multiple
+            className="hidden"
+            onChange={async (e) => {
+              const files = Array.from(e.target.files || []);
+              if (!files.length) return;
+              setPdfLoading(true);
+              try {
+                const extracted = await Promise.all(files.map(extractPdfText));
+                setPendingPdfs((prev) => [...prev, ...extracted]);
+              } catch (err: any) {
+                console.error("PDF extraction failed:", err);
+              } finally {
+                setPdfLoading(false);
+                e.target.value = "";
+              }
+            }}
+          />
+
+          {/* Paperclip — image */}
           <button
             type="button"
             title="Attach image (or paste / drag-drop)"
@@ -771,20 +853,49 @@ export default function ChatCenter({
             </svg>
           </button>
 
+          {/* PDF button */}
+          <button
+            type="button"
+            title="Attach PDF document"
+            className={`flex-shrink-0 rounded-md border px-2.5 py-2 transition-colors disabled:opacity-40 ${
+              pdfLoading
+                ? "border-amber-400/30 bg-amber-500/10 text-amber-400/60"
+                : "bg-white/5 hover:bg-white/10 border-white/10 text-white/50 hover:text-amber-300/80"
+            }`}
+            onClick={() => pdfInputRef.current?.click()}
+            disabled={isStreaming || pdfLoading}
+          >
+            {pdfLoading ? (
+              <span className="text-[10px] font-mono">reading…</span>
+            ) : (
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+                <line x1="16" y1="13" x2="8" y2="13"/>
+                <line x1="16" y1="17" x2="8" y2="17"/>
+                <polyline points="10 9 9 9 8 9"/>
+              </svg>
+            )}
+          </button>
+
           <textarea
             value={text}
             onChange={(e) => setText(e.target.value)}
             rows={2}
-            placeholder="Type a message… (Ctrl+V to paste an image)"
+            placeholder="Type a message… (Ctrl+V to paste an image, drag PDF here)"
             className="flex-1 resize-none rounded-md bg-white/5 border border-white/10 px-3 py-2 text-sm outline-none focus:border-white/30"
             onKeyDown={(e) => {
               if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
                 e.preventDefault();
+                const hasPdfs   = pendingPdfs.length > 0;
+                const hasImages = pendingImages.length > 0;
                 const t = text.trim();
-                if (!t && pendingImages.length === 0) return;
-                onSend(t, pendingImages.length > 0 ? pendingImages : undefined);
+                if (!t && !hasPdfs && !hasImages) return;
+                const pdfPrefix = hasPdfs ? pendingPdfs.map(formatPdfBlock).join("") : "";
+                onSend(pdfPrefix + t, hasImages ? pendingImages : undefined);
                 setText("");
                 setPendingImages([]);
+                setPendingPdfs([]);
               }
             }}
             onPaste={async (e) => {
@@ -797,23 +908,45 @@ export default function ChatCenter({
             onDragOver={(e) => e.preventDefault()}
             onDrop={async (e) => {
               e.preventDefault();
+              // Handle image drops
               const imgs = await extractImagesFromDataTransfer(e.dataTransfer);
-              if (imgs.length > 0) setPendingImages((prev) => [...prev, ...imgs]);
+              if (imgs.length > 0) {
+                setPendingImages((prev) => [...prev, ...imgs]);
+                return;
+              }
+              // Handle PDF drops
+              const pdfFiles = Array.from(e.dataTransfer.files).filter(
+                (f) => f.type === "application/pdf" || f.name.endsWith(".pdf")
+              );
+              if (pdfFiles.length > 0) {
+                setPdfLoading(true);
+                try {
+                  const extracted = await Promise.all(pdfFiles.map(extractPdfText));
+                  setPendingPdfs((prev) => [...prev, ...extracted]);
+                } finally {
+                  setPdfLoading(false);
+                }
+              }
             }}
             disabled={isStreaming}
           />
+
           {!isStreaming ? (
             <button
               type="button"
               className="rounded-md bg-blue-600 hover:bg-blue-500 px-4 py-2 text-sm font-semibold disabled:opacity-50"
               onClick={() => {
+                const hasPdfs   = pendingPdfs.length > 0;
+                const hasImages = pendingImages.length > 0;
                 const t = text.trim();
-                if (!t && pendingImages.length === 0) return;
-                onSend(t, pendingImages.length > 0 ? pendingImages : undefined);
+                if (!t && !hasPdfs && !hasImages) return;
+                const pdfPrefix = hasPdfs ? pendingPdfs.map(formatPdfBlock).join("") : "";
+                onSend(pdfPrefix + t, hasImages ? pendingImages : undefined);
                 setText("");
                 setPendingImages([]);
+                setPendingPdfs([]);
               }}
-              disabled={!text.trim() && pendingImages.length === 0}
+              disabled={!text.trim() && pendingImages.length === 0 && pendingPdfs.length === 0}
             >
               Send
             </button>
@@ -824,7 +957,7 @@ export default function ChatCenter({
           )}
         </div>
 
-        {/* Atelier NikolAi wordmark */ }
+        {/* Atelier NikolAi wordmark */}
         <div className="text-right text-[9px] text-white/15 font-light tracking-widest select-none pr-1">
           ATELIER NIKOLAI DESKTOP
         </div>
@@ -902,10 +1035,10 @@ function MessageBubble({
         ) : parsed ? (
           // ── Agent message: tool cards + answer ──────────────────────────────
           <div className="text-sm pr-14">
-            {/* Tool step cards */ }
+            {/* Tool step cards */}
             <ToolActionsBlock steps={parsed.steps} />
 
-            {/* Divider between cards and answer */ }
+            {/* Divider between cards and answer */}
             {parsed.answerText && (
               <div className="border-t border-white/8 pt-3 mt-1">
                 <Md text={parsed.answerText} />
@@ -920,7 +1053,7 @@ function MessageBubble({
         ) : (
           // ── Plain message (user or plain assistant) ───────────────────────
           <>
-            {/* ── V3: Image thumbnails in message ── */ }
+            {/* ── V3: Image thumbnails in message ── */}
             {m.images && m.images.length > 0 && (
               <div className="flex flex-wrap gap-2 mb-3">
                 {m.images.map((b64, i) => (

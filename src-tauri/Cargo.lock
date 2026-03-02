@@ -64,6 +64,7 @@ version = "0.1.1"
 dependencies = [
  "futures-util",
  "keyring",
+ "lazy_static",
  "once_cell",
  "reqwest",
  "serde",

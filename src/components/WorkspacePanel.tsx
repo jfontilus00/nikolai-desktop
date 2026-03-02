@@ -2,18 +2,14 @@ import { useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/api/dialog";
 import { createTwoFilesPatch } from "diff";
 import {
-  wsGetRoot,
-  wsListDir,
-  wsMkdir,
-  wsReadText,
-  wsSetRoot,
-  wsWriteText,
-  wsBatchApply,
-  wsBatchRollback,
-  type WsEntry,
-  type BatchFile,
+  wsGetRoot, wsListDir, wsMkdir, wsReadText, wsSetRoot, wsWriteText,
+  wsBatchApply, wsBatchRollback, type WsEntry, type BatchFile,
 } from "../lib/workspaceClient";
 import { loadJSON, saveJSON } from "../lib/storage";
+import {
+  buildIndex, saveIndex, clearIndex, getIndexMeta,
+  type BuildProgress, type IndexMeta,
+} from "../lib/semanticIndex";
 
 const KEY_WS_ROOT = "nikolai.workspace.root.v1";
 const KEY_WS_LAST_BATCH = "nikolai.workspace.lastBatch.v1";
@@ -68,8 +64,16 @@ export default function WorkspacePanel() {
   const [original, setOriginal] = useState<string>("");
   const [draft, setDraft] = useState<string>("");
 
-  const [busy, setBusy] = useState<string | null>(null);
+  const [busy, setBusy]     = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
+
+  // ── V5: Semantic index state ───────────────────────────────────────────────
+  const [indexMeta,     setIndexMeta]     = useState<IndexMeta | null>(null);
+  const [indexBusy,     setIndexBusy]     = useState(false);
+  const [indexProgress, setIndexProgress] = useState<BuildProgress | null>(null);
+  const [indexError,    setIndexError]    = useState<string | null>(null);
+  const [embedModel,    setEmbedModel]    = useState("nomic-embed-text");
+  const indexAbortRef = { current: null as AbortController | null };
 
   // Batch UI
   const [batchJson, setBatchJson] = useState<string>(() => loadJSON<string>(KEY_WS_LAST_BATCH + ":draft", ""));
@@ -188,29 +192,95 @@ export default function WorkspacePanel() {
     }
   }
 
+  // ── V5: Semantic index functions ──────────────────────────────────────────
+
+  function readOllamaBaseUrl(): string {
+    try {
+      const profiles  = JSON.parse(localStorage.getItem("nikolai.provider.profiles.v1") || "[]");
+      const activeId  = localStorage.getItem("nikolai.provider.active.v1");
+      const active    = profiles.find((p: any) => p.id === activeId) ?? profiles[0];
+      return (active?.provider?.ollamaBaseUrl || "http://127.0.0.1:11434").replace(/\/+$/, "");
+    } catch {
+      return "http://127.0.0.1:11434";
+    }
+  }
+
+  async function startBuildIndex() {
+    if (!root) { setIndexError("Set a workspace root first."); return; }
+    if (indexBusy) return;
+
+    setIndexBusy(true);
+    setIndexError(null);
+    setIndexProgress(null);
+
+    const ctrl = new AbortController();
+    indexAbortRef.current = ctrl;
+    const baseUrl = readOllamaBaseUrl();
+
+    try {
+      const index = await buildIndex({
+        root,
+        baseUrl,
+        model:    embedModel,
+        maxFiles: 120,
+        signal:   ctrl.signal,
+        onProgress: (p) => setIndexProgress(p),
+        listDir: async (rel) => {
+          const entries = await wsListDir(rel || ".", 500);
+          return entries.map((e) => ({ name: e.name, is_dir: e.is_dir, rel: e.rel }));
+        },
+        readFile: async (rel) => {
+          try { return await wsReadText(rel); } catch { return ""; }
+        },
+      });
+      const saved = saveIndex(root, index);
+      setIndexMeta(getIndexMeta(root));
+      if (!saved) setIndexError("⚠ Index built but localStorage is full — some chunks were dropped.");
+    } catch (e: any) {
+      if (e?.message !== "Aborted by user") setIndexError(e?.message || String(e));
+      setIndexProgress(null);
+    } finally {
+      setIndexBusy(false);
+      indexAbortRef.current = null;
+    }
+  }
+
+  function abortBuildIndex() {
+    indexAbortRef.current?.abort();
+    setIndexBusy(false);
+    setIndexProgress(null);
+  }
+
+  function dropIndex() {
+    if (!root) return;
+    if (!confirm("Delete the semantic index for this workspace?\nYou can rebuild it at any time.")) return;
+    clearIndex(root);
+    setIndexMeta(null);
+    setIndexProgress(null);
+    setIndexError(null);
+  }
+
   useEffect(() => {
     const init = async () => {
-      // If already set in Rust (same process), keep it
       const r = await wsGetRoot();
       if (r) {
         setRoot(r);
+        setIndexMeta(getIndexMeta(r));   // ← V5: load index meta on startup
         await refreshDir("");
         return;
       }
-
-      // Otherwise load persisted root and set it
       const saved = loadJSON<string | null>(KEY_WS_ROOT, null);
       if (saved) {
         try {
           const rr = await wsSetRoot(saved);
           setRoot(rr);
+          setIndexMeta(getIndexMeta(rr)); // ← V5: load index meta on startup
           await refreshDir("");
         } catch (e: any) {
           setStatus(`Could not restore workspace root: ${e?.message || String(e)}`);
         }
       }
     };
-    // FIX: was .catch(() => {}) — now surfaces errors to the UI
     init().catch((e: any) => setStatus(`Init failed: ${e?.message || String(e)}`));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -698,6 +768,116 @@ export default function WorkspacePanel() {
             )}
           </div>
         )}
+      </div>
+
+      {/* ── V5: Semantic Index ──────────────────────────────────────────────── */}
+      <div className="border border-indigo-500/20 rounded-lg bg-indigo-500/5">
+        <div className="flex items-center justify-between px-3 py-2">
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-semibold opacity-90">🧠 Semantic Index</span>
+            {indexMeta ? (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/20">
+                Ready
+              </span>
+            ) : (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/10 text-white/40 border border-white/10">
+                Not built
+              </span>
+            )}
+          </div>
+          {indexMeta && (
+            <span className="text-[10px] opacity-40">
+              {indexMeta.chunk_count} chunks · {indexMeta.file_count} files · {indexMeta.model}
+            </span>
+          )}
+        </div>
+
+        <div className="border-t border-white/10 px-3 py-2.5 space-y-2.5">
+
+          {/* What this does */}
+          <p className="text-[11px] text-white/50 leading-relaxed">
+            Embeds your codebase so the agent can find files by <em>meaning</em> in one step
+            instead of 3–5 list/read cycles. Requires <code className="bg-white/10 px-1 rounded">ollama pull nomic-embed-text</code> (~274 MB, once).
+          </p>
+
+          {/* Model selector */}
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] opacity-60 flex-shrink-0">Model</label>
+            <input
+              className="flex-1 rounded bg-black/30 border border-white/10 px-2 py-1 text-[11px] font-mono outline-none focus:border-indigo-400/40"
+              value={embedModel}
+              onChange={(e) => setEmbedModel(e.target.value.trim())}
+              placeholder="nomic-embed-text"
+            />
+          </div>
+
+          {/* Build / abort / drop buttons */}
+          <div className="flex gap-2 flex-wrap">
+            <button
+              type="button"
+              className="px-3 py-1.5 rounded bg-indigo-600/70 hover:bg-indigo-500/70 border border-indigo-400/20 text-xs font-semibold disabled:opacity-40"
+              onClick={() => void startBuildIndex()}
+              disabled={indexBusy || !root}
+              title={!root ? "Set a workspace root first" : "Scan + embed workspace files"}
+            >
+              {indexBusy ? "⏳ Building…" : (indexMeta ? "🔄 Rebuild" : "⚡ Build Index")}
+            </button>
+
+            {indexBusy && (
+              <button
+                type="button"
+                className="px-3 py-1.5 rounded bg-red-600/60 hover:bg-red-500/60 border border-red-400/20 text-xs"
+                onClick={abortBuildIndex}
+              >
+                ✕ Cancel
+              </button>
+            )}
+
+            {indexMeta && !indexBusy && (
+              <button
+                type="button"
+                className="px-3 py-1.5 rounded bg-white/10 hover:bg-white/15 border border-white/10 text-xs opacity-60 hover:opacity-100"
+                onClick={dropIndex}
+              >
+                🗑 Delete index
+              </button>
+            )}
+          </div>
+
+          {/* Progress bar */}
+          {indexProgress && indexProgress.phase !== "done" && (
+            <div className="space-y-1">
+              <div className="text-[10px] text-indigo-300/80 truncate">{indexProgress.message}</div>
+              {indexProgress.total > 0 && (
+                <div className="h-1.5 rounded-full bg-white/10 overflow-hidden">
+                  <div
+                    className="h-full bg-indigo-500 rounded-full transition-all duration-200"
+                    style={{ width: `${Math.round((indexProgress.current / indexProgress.total) * 100)}%` }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Done message */}
+          {indexProgress?.phase === "done" && (
+            <div className="text-[11px] text-emerald-400/80">{indexProgress.message}</div>
+          )}
+
+          {/* Built-at timestamp */}
+          {indexMeta && (
+            <div className="text-[10px] opacity-30">
+              Last built: {new Date(indexMeta.built_at).toLocaleString()}
+            </div>
+          )}
+
+          {/* Error */}
+          {indexError && (
+            <div className="text-[11px] text-red-400/80 whitespace-pre-wrap leading-relaxed">
+              {indexError}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

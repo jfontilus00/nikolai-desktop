@@ -1,197 +1,145 @@
+// ── Atelier NikolAi Desktop — STT Client (whisper.cpp server) ─────────────────
+//
+// The whisper.cpp server exposes ONE endpoint:
+//   POST /inference   multipart/form-data
+//   Fields:  file (audio blob), temperature, response_format
+//   Returns: { "text": "transcribed text" }
+//
+// NOT /asr — that was a different (older) project.
+// NOT /detect-language — not needed; whisper detects language automatically.
+// NOT /docs — whisper-server has no API docs endpoint.
+//
+// Ping check: GET / returns 200 with an HTML form — use that to verify running.
+//
+// The audio blob from MediaRecorder is typically audio/webm (Chrome/Edge) or
+// audio/ogg (Firefox). whisper-server accepts these directly if compiled with
+// --convert, which we pass when starting via voice.rs. If Force WAV is enabled
+// we convert to WAV first via the Web Audio API for best compatibility.
+
 import type { VoiceSettings } from "./voiceSettings";
 
-function qs(params: Record<string, string>) {
-  const u = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v != null && String(v).length) u.set(k, String(v));
-  }
-  const s = u.toString();
-  return s ? `?${s}` : "";
-}
-
-function parseSttResponse(raw: any): string {
-  if (typeof raw === "string") return raw;
-  if (!raw || typeof raw !== "object") return "";
-  return raw.text || raw.transcription || raw.result?.text || raw.data?.text || "";
-}
-
-function normalizeLang(code: any): string {
-  const s = String(code || "").trim();
-  if (!s) return "";
-  // take the first 2 letters if it looks like "en", "fr", "en-US", etc.
-  const m = s.match(/[a-zA-Z]{2}/);
-  return m ? m[0].toLowerCase() : "";
-}
-
-function parseDetectLanguage(raw: any): string {
-  if (!raw) return "";
-  if (typeof raw === "string") return normalizeLang(raw);
-
-  // common shapes:
-  // { language: "en" }
-  // { lang: "en" }
-  // { detected_language: "en" }
-  // { result: { language: "en" } }
-  // [{ language: "en", probability: 0.98 }, ...]
-  const direct =
-    raw.language ??
-    raw.lang ??
-    raw.detected_language ??
-    raw.result?.language ??
-    raw.result?.lang;
-
-  if (direct) return normalizeLang(direct);
-
-  if (Array.isArray(raw) && raw.length) {
-    const first = raw[0];
-    const v = first?.language ?? first?.lang;
-    return normalizeLang(v);
-  }
-
-  return "";
-}
-
-function encodeWav(audioBuffer: AudioBuffer): ArrayBuffer {
-  const numChannels = audioBuffer.numberOfChannels;
-  const sampleRate = audioBuffer.sampleRate;
-  const numFrames = audioBuffer.length;
-
-  const interleaved = new Float32Array(numFrames * numChannels);
-  for (let ch = 0; ch < numChannels; ch++) {
-    const data = audioBuffer.getChannelData(ch);
-    for (let i = 0; i < numFrames; i++) interleaved[i * numChannels + ch] = data[i];
-  }
-
-  const bytesPerSample = 2;
-  const blockAlign = numChannels * bytesPerSample;
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = interleaved.length * bytesPerSample;
-
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
-
-  let offset = 0;
-  const writeString = (s: string) => { for (let i = 0; i < s.length; i++) view.setUint8(offset++, s.charCodeAt(i)); };
-
-  writeString("RIFF");
-  view.setUint32(offset, 36 + dataSize, true); offset += 4;
-  writeString("WAVE");
-  writeString("fmt ");
-  view.setUint32(offset, 16, true); offset += 4;
-  view.setUint16(offset, 1, true); offset += 2;
-  view.setUint16(offset, numChannels, true); offset += 2;
-  view.setUint32(offset, sampleRate, true); offset += 4;
-  view.setUint32(offset, byteRate, true); offset += 4;
-  view.setUint16(offset, blockAlign, true); offset += 2;
-  view.setUint16(offset, 16, true); offset += 2;
-  writeString("data");
-  view.setUint32(offset, dataSize, true); offset += 4;
-
-  for (let i = 0; i < interleaved.length; i++) {
-    let s = Math.max(-1, Math.min(1, interleaved[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-    offset += 2;
-  }
-
-  return buffer;
-}
+// ── WAV conversion ────────────────────────────────────────────────────────────
+// Convert any audio blob → 16-bit 16kHz mono WAV.
+// whisper-base.en works best with 16kHz mono.
 
 async function blobToWav(blob: Blob): Promise<Blob> {
-  const ab = await blob.arrayBuffer();
-  const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-  const audio = await ctx.decodeAudioData(ab.slice(0));
-  const wav = encodeWav(audio);
-  try { await ctx.close(); } catch {}
-  return new Blob([wav], { type: "audio/wav" });
+  const arrayBuf = await blob.arrayBuffer();
+  const ctx      = new OfflineAudioContext(1, 1, 16000);
+
+  let audioBuffer: AudioBuffer;
+  try {
+    audioBuffer = await ctx.decodeAudioData(arrayBuf);
+  } catch {
+    // If decode fails, send the raw blob and let whisper-server handle it
+    return blob;
+  }
+
+  // Resample to 16kHz mono
+  const length     = Math.ceil(audioBuffer.duration * 16000);
+  const offlineCtx = new OfflineAudioContext(1, length, 16000);
+  const src        = offlineCtx.createBufferSource();
+  src.buffer       = audioBuffer;
+  src.connect(offlineCtx.destination);
+  src.start(0);
+  const rendered   = await offlineCtx.startRendering();
+
+  // Encode as 16-bit PCM WAV
+  const pcm        = rendered.getChannelData(0);
+  const wavBuf     = new ArrayBuffer(44 + pcm.length * 2);
+  const view       = new DataView(wavBuf);
+
+  const writeStr = (off: number, s: string) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+  writeStr(0, "RIFF");
+  view.setUint32(4,  36 + pcm.length * 2, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);   // PCM chunk size
+  view.setUint16(20, 1, true);    // PCM format
+  view.setUint16(22, 1, true);    // mono
+  view.setUint32(24, 16000, true);// sample rate
+  view.setUint32(28, 32000, true); // byte rate = 16000 * 1 * 2
+  view.setUint16(32, 2, true);    // block align
+  view.setUint16(34, 16, true);   // bits per sample
+  writeStr(36, "data");
+  view.setUint32(40, pcm.length * 2, true);
+
+  let off = 44;
+  for (let i = 0; i < pcm.length; i++) {
+    const s = Math.max(-1, Math.min(1, pcm[i]));
+    view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    off += 2;
+  }
+
+  return new Blob([wavBuf], { type: "audio/wav" });
 }
 
-async function postMultipart(url: string, blob: Blob, filename: string): Promise<Response> {
-  async function postWithField(fieldName: string): Promise<Response> {
-    const fd = new FormData();
-    fd.append(fieldName, blob, filename);
-    return await fetch(url, { method: "POST", body: fd });
-  }
+// ── Core transcribe function ──────────────────────────────────────────────────
 
-  // primary field name
-  let r = await postWithField("audio_file");
+export async function sttTranscribe(
+  blob: Blob,
+  settings: VoiceSettings,
+): Promise<string> {
+  const base = (settings.sttBaseUrl || "http://127.0.0.1:9900").replace(/\/+$/, "");
+  // Always use /inference — that is the ONLY valid endpoint on whisper-server
+  const url  = `${base}/inference`;
 
-  // fallback for other servers
-  if (!r.ok && (r.status === 400 || r.status === 422)) {
-    r = await postWithField("file");
-  }
-
-  return r;
-}
-
-async function detectLanguage(blob: Blob, filename: string, settings: VoiceSettings): Promise<string> {
-  const base = settings.sttBaseUrl.replace(/\/+$/, "");
-  const url = `${base}/detect-language`;
-
-  const r = await postMultipart(url, blob, filename);
-
-  if (!r.ok) {
-    // detection failure should NOT block transcription
-    return "";
-  }
-
-  const ct = r.headers.get("content-type") || "";
-  if (ct.includes("application/json")) {
-    try {
-      const j = await r.json();
-      return parseDetectLanguage(j);
-    } catch {
-      return "";
-    }
-  }
-
-  // sometimes returns plain text
-  const t = await r.text().catch(() => "");
-  return normalizeLang(t);
-}
-
-export async function sttTranscribe(audio: Blob, settings: VoiceSettings): Promise<string> {
-  const base = settings.sttBaseUrl.replace(/\/+$/, "");
-  const path = settings.sttPath.startsWith("/") ? settings.sttPath : `/${settings.sttPath}`;
-
-  let blob = audio;
-  let filename = "audio.webm";
-
+  // Optionally convert to WAV for best compatibility
+  let audioBlob = blob;
   if (settings.forceWav) {
-    try {
-      blob = await blobToWav(audio);
-      filename = "audio.wav";
-    } catch {}
+    try { audioBlob = await blobToWav(blob); } catch { /* fall back to raw */ }
   }
 
-  // Language decision:
-  // - if user typed a language => use it
-  // - else if detectLanguageEnabled => call /detect-language, then use detected code
-  // - else leave empty (server auto)
-  let lang = String(settings.sttLanguage || "").trim();
+  const ext      = audioBlob.type.includes("wav") ? "wav" : "webm";
+  const filename = `audio.${ext}`;
 
-  if (!lang && settings.detectLanguageEnabled) {
-    try {
-      lang = await detectLanguage(blob, filename, settings);
-    } catch {
-      // ignore
-    }
+  const form = new FormData();
+  form.append("file",             new File([audioBlob], filename, { type: audioBlob.type }));
+  form.append("temperature",      "0.0");
+  form.append("temperature_inc",  "0.2");
+  form.append("response_format",  "json");
+
+  // Language: blank = auto-detect (recommended)
+  const lang = (settings.sttLanguage || "").trim();
+  if (lang) form.append("language", lang);
+
+  const resp = await fetch(url, { method: "POST", body: form });
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(
+      `STT failed (${resp.status}): ${body.slice(0, 200)}\n` +
+      `Make sure whisper-server is running on port 9900. ` +
+      `Check Voice panel → Start servers.`
+    );
   }
 
-  const url = `${base}${path}${qs({ task: settings.sttTask || "transcribe", language: lang })}`;
+  const data = await resp.json() as { text?: string; error?: string };
 
-  const r = await postMultipart(url, blob, filename);
-  const ct = r.headers.get("content-type") || "";
+  if (data.error) throw new Error(`Whisper error: ${data.error}`);
 
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`STT failed (${r.status}): ${t.slice(0, 500)}`);
+  const text = (data.text || "").trim();
+  if (!text) throw new Error("Whisper returned empty transcript. Try speaking louder or closer to mic.");
+
+  // ── Silence token filter ──────────────────────────────────────────────────
+  // Whisper outputs these special tokens when it hears only silence or noise.
+  // They must NEVER be sent to the AI as chat messages — throw so the caller
+  // shows "No speech detected" in the status bar instead.
+  const silenceTokens = /^\[BLANK_AUDIO\]$|^\(silence\)$|^\[noise\]$|^\[Music\]$|^\[Applause\]$/i;
+  if (silenceTokens.test(text)) {
+    throw new Error("No speech detected — whisper heard only silence. Speak clearly after the ready tone.");
   }
 
-  if (ct.includes("application/json")) {
-    const j = await r.json();
-    return String(parseSttResponse(j) || "").trim();
-  }
+  return text;
+}
 
-  const t = await r.text();
-  return String(t || "").trim();
+// ── Ping helper — checks if whisper-server is alive ──────────────────────────
+// whisper-server responds with an HTML form at GET /
+// Returns true if reachable, throws with message if not.
+
+export async function sttPing(baseUrl: string): Promise<string> {
+  const base = (baseUrl || "http://127.0.0.1:9900").replace(/\/+$/, "");
+  // GET / returns the HTML upload form — confirms server is alive
+  const resp = await fetch(`${base}/`, { method: "GET" });
+  if (resp.ok) return `Whisper-server running ✓ (${resp.status} at ${base}/)`;
+  throw new Error(`Server responded with ${resp.status} — may still be loading. Wait 10s and try again.`);
 }

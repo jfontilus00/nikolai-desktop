@@ -4,6 +4,8 @@ import { ollamaStreamChat } from "./ollamaStream";
 import { mcpListTools, getCachedTools, type McpTool } from "./mcp";
 import { appendToolLog } from "./toolLog";
 import { formatToolResult } from "./toolResult";
+import { loadMemory, formatMemoryForPrompt, addFact } from "./memory";
+import { loadIndex, searchIndex, formatSearchResults, type SemanticIndex } from "./semanticIndex";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -53,8 +55,8 @@ const MAX_PLAN_PARSE_RETRIES = 2;
 // We keep: all original user messages (the goal) + last KEEP_LAST_TOOL_RESULTS
 // tool exchange messages. Everything older is dropped.
 //
-const MAX_CONTEXT_CHARS     = 10_000; // ~2500 tokens — safe headroom for most 8B models
-const KEEP_LAST_TOOL_RESULTS = 4;     // keep last 4 tool result messages
+const MAX_CONTEXT_CHARS     = 12_000; // ~3000 tokens — safe headroom for most 8B models
+const KEEP_LAST_TOOL_RESULTS = 8;     // keep last 8 tool results — enough for 9-file tasks to remember all staged writes
 
 // ── Tool blocklist ────────────────────────────────────────────────────────────
 
@@ -70,7 +72,8 @@ function isAgentTool(name: string): boolean {
 // ── Tauri guard ───────────────────────────────────────────────────────────────
 
 function isTauri(): boolean {
-  return typeof window !== "undefined" && (window as any).__TAURI__ != null;
+  return typeof window !== "undefined" &&
+    ((window as any).__TAURI__ != null || (window as any).__TAURI_IPC__ != null);
 }
 
 // ── Workspace root check ──────────────────────────────────────────────────────
@@ -78,9 +81,32 @@ function isTauri(): boolean {
 async function getWorkspaceRoot(): Promise<string | null> {
   if (!isTauri()) return null;
   try {
-    return await invoke<string | null>("ws_get_root");
+    const raw = await invoke<string | null>("ws_get_root");
+    if (!raw) return null;
+    // Strip Windows \\?\\ extended-length prefix added by Rust canonicalize().
+    // Without this, path comparisons and batch path stripping fail.
+    let stripped = raw;
+    if (stripped.startsWith("\\\\?\\")) stripped = stripped.slice(4);
+    if (stripped.startsWith("//?/")) stripped = stripped.slice(4);
+    return stripped.replace(/\\/g, "/");
   } catch {
     return null;
+  }
+}
+
+// ── V4-B: Silent tool runner (no log, no status, no step record) ──────────────
+// Used for context grounding calls that happen before the main loop.
+// We don't want these to show up in tool logs or action cards.
+async function silentTool(
+  exec: (name: string, args: any) => Promise<any>,
+  name: string,
+  args: any,
+): Promise<string> {
+  try {
+    const out = await exec(name, args);
+    return formatToolResult(name, out).text;
+  } catch {
+    return "";
   }
 }
 
@@ -131,7 +157,7 @@ async function rollbackBatch(
   onStatus?.("⏪ Rolling back changes…");
   try {
     const result = await invoke<BatchRollbackResult>("ws_batch_rollback", {
-      batchId: batchId ?? null,
+      batch_id: batchId ?? null,
     });
     appendToolLog({
       id: `tl-rollback-${Date.now()}`,
@@ -228,6 +254,7 @@ function humanStatus(toolName: string, args: any): string {
   if (toolName === "fs.edit_file")        return `✏️  Editing ${short(a.path ?? "file")}`;
   if (toolName === "fs.list_directory")   return `📁 Listing ${short(a.path ?? "directory")}`;
   if (toolName === "fs.search_files")     return `🔍 Searching "${short(a.query ?? "…")}" in ${short(a.path ?? ".")}`;
+  if (toolName === "semantic.find")       return `🧠 Semantic search: "${short(a.query ?? "…")}"`;
   if (toolName === "fs.create_directory") return `📁 Creating directory ${short(a.path ?? "")}`;
   if (toolName === "fs.delete_file")      return `🗑  Deleting ${short(a.path ?? "file")}`;
   if (toolName === "fs.move_file")        return `📦 Moving ${short(a.src ?? a.from ?? "file")}`;
@@ -254,14 +281,20 @@ function humanSummary(toolName: string, args: any, ok: boolean, resultText: stri
 
   if (toolName === "fs.read_file")
     return `${icon} Read ${short(a.path ?? "file")}${ok ? ` (${resultText.length} chars)` : `: ${resultText}`}`;
-  if (toolName === "fs.write_file")
+  if (toolName === "fs.write_file") {
+    if (!ok) return `✗ FAILED to stage ${short(a.path ?? "file")}: ${String(resultText || "").slice(0, 140)}`;
     return `${icon} Staged ${short(a.path ?? "file")} for batch write`;
+  }
   if (toolName === "fs.edit_file")
     return `${icon} Edited ${short(a.path ?? "file")}`;
   if (toolName === "fs.list_directory")
     return `${icon} Listed ${short(a.path ?? "directory")}`;
   if (toolName === "fs.search_files")
     return `${icon} Searched "${short(a.query ?? "")}"`;
+  if (toolName === "semantic.find")
+    return `${icon} Semantic: "${short(a.query ?? "")}"${ok ? "" : ` — ${resultText.slice(0, 50)}`}`;
+  if (toolName === "memory.add_fact")
+    return `${icon} ${ok ? "Saved to memory:" : "Memory save failed:"} "${short(a.text ?? "")}"`;
   if (!ok) return `${icon} ${toolName.split(".").pop()} failed: ${resultText.slice(0, 60)}`;
   return `${icon} ${toolName.split(".").pop()}`;
 }
@@ -306,13 +339,41 @@ function parsePlan(raw: string): Plan | null {
 }
 
 // ── Tool catalog ──────────────────────────────────────────────────────────────
+//
+// MCP tools from cache + optional synthetic tools.
+// semantic.find is prepended when an index exists — the planner will
+// prefer it over repeated list_directory/read_file chains.
 
-function toolCatalog(tools: McpTool[]): string {
+const SEMANTIC_TOOL_DESCRIPTION =
+  `semantic.find — Search the codebase by MEANING. ` +
+  `Use when you need to locate code by concept/purpose (e.g. "error handling", "auth middleware", "database query"). ` +
+  `Returns top matching files with relevant code snippets in ONE step. ` +
+  `Much faster than list_directory → read_file chains. ` +
+  `Args: {"query": "<natural language>", "top_k": 5}`;
+
+// Only shown when workspace root is set — facts are workspace-scoped
+const MEMORY_TOOL_DESCRIPTION =
+  `memory.add_fact — Save a permanent fact about this workspace. ` +
+  `Use ONLY when the user explicitly says "remember", "note that", "save that", or similar. ` +
+  `Do NOT use speculatively or for general observations. ` +
+  `Args: {"text": "<single clear fact to remember, one sentence>"}`;
+
+function toolCatalog(tools: McpTool[], hasSemanticIndex: boolean, hasWorkspaceRoot: boolean): string {
+  const lines: string[] = [];
+
+  if (hasSemanticIndex) {
+    lines.push(`- ${SEMANTIC_TOOL_DESCRIPTION}`);
+  }
+  if (hasWorkspaceRoot) {
+    lines.push(`- ${MEMORY_TOOL_DESCRIPTION}`);
+  }
+
   const allowed = (tools || []).filter((t) => isAgentTool(t.name));
-  if (allowed.length === 0) return "(no tools available)";
-  return allowed
-    .map((t) => `- ${t.name}${t.description ? ` — ${t.description}` : ""}`)
-    .join("\n");
+  for (const t of allowed) {
+    lines.push(`- ${t.name}${t.description ? ` — ${t.description}` : ""}`);
+  }
+
+  return lines.length > 0 ? lines.join("\n") : "(no tools available)";
 }
 
 // ── Core single-tool runner ───────────────────────────────────────────────────
@@ -364,16 +425,24 @@ function buildPlannerSystem(
   step: number,
   maxSteps: number,
   batchMode: boolean,
+  memoryText?: string,
 ): OllamaMsg {
   const batchNote = batchMode
     ? `\nBATCH MODE ACTIVE: fs.write_file calls are staged in memory and committed atomically at the end. ` +
-      `Do NOT try to read a file you just staged — plan all writes first, then use action:final.\n`
+      `Do NOT try to read a file you just staged — plan all writes first, then use action:final.\n` +
+      `PATH RULE (CRITICAL): ALWAYS use RELATIVE paths only (e.g. 'file.txt' or 'subdir/file.txt'). ` +
+      `NEVER use absolute paths like C:\\... or /Users/... — the workspace root is already set for you.\n`
     : `\nNo workspace root set — writes execute immediately via MCP.\n`;
+
+  // ── V4-C: Inject remembered facts ─────────────────────────────────────────
+  const memNote = memoryText
+    ? `\nKnown facts about this workspace (from memory):\n${memoryText}\n`
+    : "";
 
   return {
     role: "system",
     content:
-      `You are a precise tool planner (step ${step}/${maxSteps}).${batchNote}\n` +
+      `You are a precise tool planner (step ${step}/${maxSteps}).${batchNote}${memNote}\n` +
       `Output EXACTLY ONE JSON object — no other text, no markdown, no explanation.\n\n` +
       `TWO valid output shapes:\n` +
       `1. Call a tool:   {"action":"tool","name":"<exact_tool_name>","args":{...}}\n` +
@@ -402,6 +471,10 @@ export async function agenticStreamChat(opts: {
   maxSteps?: number;
   executeTool?: (name: string, args: any) => Promise<any>;
   plannerModel?: string;
+  // Optional overrides — allows non-Ollama providers (Anthropic, OpenAI, etc.)
+  // to drive the agentic loop. When omitted, defaults to ollamaChat/ollamaStreamChat.
+  chatFn?: (messages: OllamaMsg[], signal: AbortSignal) => Promise<string>;
+  streamFn?: (messages: OllamaMsg[], signal: AbortSignal, onToken: (t: string) => void) => Promise<void>;
 }): Promise<void> {
   const maxSteps = opts.maxSteps ?? 10;
 
@@ -434,49 +507,286 @@ export async function agenticStreamChat(opts: {
   }
 
   // Determine batch mode (workspace root required)
-  const workspaceRoot = await getWorkspaceRoot();
-  const batchMode = workspaceRoot != null;
+  let workspaceRoot = await getWorkspaceRoot();
+  let batchMode = workspaceRoot != null;
   const pendingWrites: PendingWrite[] = [];
 
-  // Batching executor — intercepts fs.write_file, stages instead of writing
-  const batchingExecutor = async (name: string, args: any): Promise<any> => {
-    if (batchMode && name === "fs.write_file") {
-      const path    = args?.path    ?? "";
-      const content = args?.content ?? "";
+  // ── V4-C: Load session memory ─────────────────────────────────────────────
+  const memoryFacts = workspaceRoot ? loadMemory(workspaceRoot) : [];
+  const memoryText  = formatMemoryForPrompt(memoryFacts);
 
-      if (!path || typeof content !== "string") {
+  // ── V5: Load semantic index ───────────────────────────────────────────────
+  // Built once by the user in WorkspacePanel → "Build Semantic Index".
+  // If present, adds "semantic.find" to the tool catalog so the planner can
+  // search by meaning instead of wasting 3-5 steps on file discovery.
+  const semanticIndex:    SemanticIndex | null = workspaceRoot ? loadIndex(workspaceRoot) : null;
+  const hasSemanticIndex: boolean              = (semanticIndex?.chunks?.length ?? 0) > 0;
+
+  // ── V4-B: Context grounding ───────────────────────────────────────────────
+  // Before the loop starts, silently read the project root structure and
+  // README so the agent already knows where it is. This saves step 1 on
+  // almost every agentic task (previously: always list_directory first).
+  // Uses silentTool — no log entry, no action card, no status flash.
+  let convo: OllamaMsg[] = [...opts.messages];
+
+  if (batchMode && opts.executeTool) {
+    opts.onStatus?.("📂 Reading project context…");
+    try {
+      const listText = await silentTool(opts.executeTool, "fs.list_directory", { path: "." });
+      if (listText) {
+        let grounding = `Workspace root: ${workspaceRoot}\n\nProject structure:\n${listText.slice(0, 1500)}`;
+        // Try README.md — highly useful for agent orientation
+        const readmeText = await silentTool(opts.executeTool, "fs.read_file", { path: "README.md" });
+        if (readmeText) grounding += `\n\nREADME.md:\n${readmeText.slice(0, 800)}`;
+        // Prepend as a system message so it doesn't get trimmed by trimContext
+        convo = [
+          { role: "system" as const, content: grounding },
+          ...convo,
+        ];
+      }
+    } catch { /* grounding is best-effort */ }
+    opts.onStatus?.("");
+  }
+
+  // Batching executor — intercepts fs.write_file, stages instead of writing
+  // ── Path helpers for batch mode ───────────────────────────────────────────
+  function normalizeBatchPath(p: string): string {
+    let s = String(p || "").trim();
+    if (s.startsWith("\\\\?\\")) s = s.slice(4);  // strip \\?\
+    if (s.startsWith("//?/")) s = s.slice(4);             // strip //?/
+    s = s.replace(/\\/g, "/");
+    if (s.startsWith("./")) s = s.slice(2);
+    return s;
+  }
+
+  function isAbsPath(p: string): boolean {
+    if (!p) return false;
+    if (/^[a-zA-Z]:\//.test(p)) return true;
+    if (p.startsWith("/")) return true;
+    if (p.startsWith("//")) return true;
+    return false;
+  }
+
+  // Case-insensitive (Windows) — strips workspace root from absolute path.
+  // Returns relative path string, or null if not under root.
+  function toRelUnderRoot(p: string, root: string | null): string | null {
+    if (!root) return null;
+    const normRoot = normalizeBatchPath(root).replace(/\/+$/, "");
+    const normPath = normalizeBatchPath(p);
+    const rootLower = normRoot.toLowerCase();
+    const pathLower = normPath.toLowerCase();
+    if (pathLower === rootLower) return "";
+    if (!pathLower.startsWith(rootLower + "/")) return null;
+    return normPath.slice(normRoot.length + 1);
+  }
+
+  // Normalize a path arg that may be absolute, relative, or workspace-root-prefixed.
+  // Returns a clean relative path or throws if absolute and outside workspace root.
+  function resolveBatchPath(rawPath: string, opName: string): string {
+    let p = normalizeBatchPath(rawPath);
+    if (workspaceRoot) {
+      const rel = toRelUnderRoot(p, workspaceRoot);
+      if (rel !== null) {
+        p = rel; // was absolute-under-root → strip to relative
+      } else if (isAbsPath(p)) {
+        throw new Error(
+          `${opName}: absolute path is outside workspace root — use a RELATIVE path instead. ` +
+          `Got: "${p}", root: "${workspaceRoot}"`
+        );
+      }
+    }
+    return p;
+  }
+
+  const batchingExecutor = async (name: string, args: any): Promise<any> => {
+    // Refresh workspace root each tool call (root can change mid-run from UI)
+    const freshRoot = await getWorkspaceRoot();
+    if (freshRoot !== workspaceRoot) {
+      if (pendingWrites.length > 0) {
+        throw new Error("Workspace root changed during a batch; staged writes were not committed. Retry your request.");
+      }
+      console.warn(`[agentic] Workspace root changed during run: ${workspaceRoot ?? "null"} -> ${freshRoot ?? "null"}`);
+      workspaceRoot = freshRoot;
+      batchMode = workspaceRoot != null;
+    }
+    // ── fs.write_file — stage, don't write immediately ───────────────────────
+    if (batchMode && name === "fs.write_file") {
+      const content = args?.content ?? "";
+      if (!args?.path || typeof content !== "string") {
         return opts.executeTool!(name, args); // let it fail with a clear error
+      }
+
+      let path: string;
+      try {
+        path = resolveBatchPath(args.path, "fs.write_file");
+      } catch (e: any) {
+        appendToolLog({
+          id: `tl-stage-${Date.now()}`, ts: Date.now(),
+          tool: "fs.write_file [rejected]", args: { path: args.path },
+          ok: false, error: e.message,
+        });
+        return { content: [{ type: "text", text: e.message }] };
+      }
+
+      args.path = path; // mutate so step summary shows real path
+
+      if (!path) {
+        return { content: [{ type: "text", text: "fs.write_file: resolved path is empty — provide a filename." }] };
+      }
+      if (isAbsPath(path)) {
+        return { content: [{ type: "text", text: `fs.write_file: batch paths must be relative, got: ${path}` }] };
       }
 
       pendingWrites.push({ path, content });
       appendToolLog({
-        id: `tl-stage-${Date.now()}`,
-        ts: Date.now(),
+        id: `tl-stage-${Date.now()}`, ts: Date.now(),
         tool: "fs.write_file [staged]",
         args: { path, contentLength: content.length },
         ok: true,
       });
+      // Show live count so user sees progress on multi-file tasks
+      opts.onStatus?.(`💾 ${pendingWrites.length} file(s) staged…`);
       return {
-        content: [{
-          type: "text",
-          text: `Staged: ${path} (${content.length} chars). Will be written atomically at the end.`,
-        }],
+        content: [{ type: "text", text: `Staged: ${path} (${content.length} chars). Will be written atomically at the end.` }],
       };
     }
+
+    // ── fs.create_directory → Tauri ws_mkdir (bypasses MCP allowed-dirs restriction) ─
+    if (batchMode && name === "fs.create_directory" && args?.path) {
+      let dirPath: string;
+      try {
+        dirPath = resolveBatchPath(args.path, "fs.create_directory");
+      } catch (e: any) {
+        appendToolLog({ id: `tl-mkdir-${Date.now()}`, ts: Date.now(), tool: "fs.create_directory", args: { path: args.path }, ok: false, error: e.message });
+        return { content: [{ type: "text", text: e.message }] };
+      }
+      try {
+        await invoke("ws_mkdir", { relDir: dirPath });
+        appendToolLog({ id: `tl-mkdir-${Date.now()}`, ts: Date.now(), tool: "fs.create_directory", args: { path: dirPath }, ok: true });
+        return { content: [{ type: "text", text: `Directory created: ${dirPath}` }] };
+      } catch (e: any) {
+        const errMsg = e?.message || String(e);
+        appendToolLog({ id: `tl-mkdir-err-${Date.now()}`, ts: Date.now(), tool: "fs.create_directory", args: { path: dirPath }, ok: false, error: errMsg });
+        return { content: [{ type: "text", text: `fs.create_directory failed: ${errMsg}` }] };
+      }
+    }
+
+    // ── fs.copy_file → read source via ws_read_text, stage destination write ──
+    // MCP copy might write to a location outside workspace root.
+    // This version guarantees both src and dst stay within workspace root.
+    if (batchMode && (name === "fs.copy_file" || name === "fs.rename_file" || name === "fs.move_file")) {
+      const paths = Array.isArray(args?.paths) ? args.paths : null;
+      const srcKey = args?.src ?? args?.source ?? args?.from ?? args?.oldPath ?? (paths ? paths[0] : "");
+      const dstKey = args?.dst ?? args?.destination ?? args?.to ?? args?.newPath ?? (paths ? paths[1] : "");
+      const srcArg = Object.keys(args).find(k => ["src","source","from","oldPath"].includes(k));
+      const dstArg = Object.keys(args).find(k => ["dst","destination","to","newPath"].includes(k));
+
+      if (!srcKey || !dstKey) {
+        return opts.executeTool!(name, args); // pass through if args unclear
+      }
+
+      let srcPath: string, dstPath: string;
+      try {
+        srcPath = resolveBatchPath(srcKey, name + ".src");
+        dstPath = resolveBatchPath(dstKey, name + ".dst");
+      } catch (e: any) {
+        return { content: [{ type: "text", text: e.message }] };
+      }
+
+      try {
+        const content = await invoke<string>("ws_read_text", { rel: srcPath });
+        pendingWrites.push({ path: dstPath, content });
+        appendToolLog({ id: `tl-copy-${Date.now()}`, ts: Date.now(), tool: name + " [staged]", args: { src: srcPath, dst: dstPath }, ok: true });
+        return { content: [{ type: "text", text: `Staged copy: ${srcPath} → ${dstPath} (${content.length} chars). Will be written atomically.` }] };
+      } catch (e: any) {
+        const errMsg = e?.message || String(e);
+        appendToolLog({ id: `tl-copy-err-${Date.now()}`, ts: Date.now(), tool: name, args: { src: srcPath, dst: dstPath }, ok: false, error: errMsg });
+        return { content: [{ type: "text", text: `${name} failed: ${errMsg}` }] };
+      }
+    }
+
+    // ── Normalize path args for ALL fs.* tools (copy, move, rename, delete, read, list)
+    // Without this, the model passes relative paths that the MCP server resolves
+    // against its own CWD (not the workspace root) → files land in wrong location.
+    if (batchMode && name.startsWith("fs.") && workspaceRoot) {
+      // All parameter keys that might carry file paths
+      const pathKeys = ["path", "src", "dst", "from", "to", "source", "destination", "oldPath", "newPath"];
+      let normalizedArgs = { ...args };
+      const absRoot = normalizeBatchPath(workspaceRoot).replace(/\/+$/, "");
+      for (const key of pathKeys) {
+        if (typeof normalizedArgs[key] === "string" && normalizedArgs[key]) {
+          const raw = normalizedArgs[key] as string;
+          const n = normalizeBatchPath(raw);
+          // If it's a bare relative path, prepend workspace root so MCP can find it
+          if (!isAbsPath(n)) {
+            normalizedArgs[key] = absRoot + "/" + n;
+          } else {
+            const rel = toRelUnderRoot(n, workspaceRoot);
+            if (rel === null) {
+              throw new Error(`${name}: absolute path is outside workspace root  use a RELATIVE path instead. Got: "${n}", root: "${absRoot}"`);
+            }
+            normalizedArgs[key] = absRoot + "/" + rel;
+          }
+        }
+      }
+      return opts.executeTool!(name, normalizedArgs);
+    }
+
     return opts.executeTool!(name, args);
   };
 
-  const catalog = toolCatalog(tools);
-  let convo: OllamaMsg[] = [...opts.messages];
+  const catalog = toolCatalog(tools, hasSemanticIndex, batchMode);
   const steps: StepRecord[] = [];
   let consecutiveParseFailures = 0;
+
+  // ── V5: Semantic executor ─────────────────────────────────────────────────
+  // Wraps batchingExecutor. Intercepts "semantic.find" and handles it locally
+  // using the pre-built index + Ollama embeddings. All other tool calls pass
+  // through to batchingExecutor → MCP unchanged.
+  const semanticExecutor = async (name: string, args: any): Promise<any> => {
+    // ── memory.add_fact — writes to localStorage synchronously ───────────────
+    if (name === "memory.add_fact") {
+      const text = String(args?.text ?? "").trim();
+      if (!text) {
+        return { content: [{ type: "text", text: "memory.add_fact: 'text' argument is required." }] };
+      }
+      if (!workspaceRoot) {
+        return { content: [{ type: "text", text: "memory.add_fact: no workspace root set — cannot save fact." }] };
+      }
+      try {
+        const fact = addFact(workspaceRoot, text, "agent");
+        return { content: [{ type: "text", text: `Saved to memory (id: ${fact.id}): "${text}"` }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `memory.add_fact failed: ${e?.message || String(e)}` }] };
+      }
+    }
+
+    if (name === "semantic.find") {
+      const query = String(args?.query ?? "").trim();
+      const topK  = Math.min(Number(args?.top_k ?? 5), 10);
+
+      if (!query) {
+        return { content: [{ type: "text", text: "semantic.find: query must be a non-empty string." }] };
+      }
+      if (!semanticIndex || !hasSemanticIndex) {
+        return { content: [{ type: "text", text: "No semantic index available. Use fs.search_files or ask the user to build the index in the Workspace panel." }] };
+      }
+      try {
+        const results = await searchIndex(query, opts.baseUrl, semanticIndex, topK);
+        return { content: [{ type: "text", text: formatSearchResults(results) }] };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `semantic.find error: ${e?.message || String(e)}` }] };
+      }
+    }
+    return batchingExecutor(name, args);
+  };
 
   // ── Agentic loop ──────────────────────────────────────────────────────────
 
   for (let step = 1; step <= maxSteps; step++) {
     if (opts.signal.aborted) throw Object.assign(new Error("Aborted"), { name: "AbortError" });
 
-    const plannerSystem = buildPlannerSystem(catalog, step, maxSteps, batchMode);
+    const plannerSystem = buildPlannerSystem(catalog, step, maxSteps, batchMode, memoryText);
 
     opts.onStatus?.(`🤔 Planning step ${step}…`);
 
@@ -492,12 +802,14 @@ export async function agenticStreamChat(opts: {
 
     let planText: string;
     try {
-      planText = await ollamaChat({
-        baseUrl: opts.baseUrl,
-        model: opts.plannerModel || opts.model,
-        messages: [plannerSystem, ...trimmedConvo], // ← use trimmed, not full convo
-        signal: opts.signal,
-      });
+      planText = opts.chatFn
+        ? await opts.chatFn([plannerSystem, ...trimmedConvo], opts.signal)
+        : await ollamaChat({
+            baseUrl: opts.baseUrl,
+            model: opts.plannerModel || opts.model,
+            messages: [plannerSystem, ...trimmedConvo],
+            signal: opts.signal,
+          });
     } catch (e: any) {
       if (e?.name === "AbortError") throw e;
       convo.push({ role: "assistant", content: `[planner error] ${e?.message || String(e)}` });
@@ -538,15 +850,17 @@ export async function agenticStreamChat(opts: {
       continue;
     }
 
-    if (!tools.some((t) => t.name === toolName)) {
-      convo.push({ role: "assistant", content: `[tool not found] "${toolName}" does not exist.` });
+    // Synthetic tools handled by semanticExecutor — not in the MCP tool list
+    const isSynthetic = toolName === "semantic.find" || toolName === "memory.add_fact";
+    if (!isSynthetic && !tools.some((t) => t.name === toolName)) {
+      convo.push({ role: "assistant", content: `[tool not found] "${toolName}" does not exist. Choose from the available tools list.` });
       continue;
     }
 
     const result = await runTool({
       toolName,
-      args: plan.args ?? {},
-      exec: batchingExecutor,
+      args:     plan.args ?? {},
+      exec:     semanticExecutor,   // ← V5: wraps batchingExecutor, intercepts semantic.find
       onStatus: opts.onStatus,
     });
 
@@ -572,26 +886,83 @@ export async function agenticStreamChat(opts: {
   if (pendingWrites.length > 0) {
     if (opts.signal.aborted) throw Object.assign(new Error("Aborted"), { name: "AbortError" });
 
+    const freshRoot = await getWorkspaceRoot();
+    if (freshRoot !== workspaceRoot) {
+      console.warn("[agentic] Workspace root changed before commit; skipping batch commit.");
+      steps.push({
+        tool: "batch_commit",
+        args: { files: pendingWrites.map((w) => w.path) },
+        ok: false,
+        summary: "✗ Workspace root changed before commit; staged writes were not committed.",
+      });
+      opts.onToken("\n\n⚠️ Workspace root changed before commit; staged writes were not committed. Retry your request.\n\n");
+      return;
+    }
+
     const commitResult = await commitBatch(pendingWrites, opts.onStatus);
 
     if (commitResult.ok) {
       const { batch_id, applied } = commitResult.result;
-      steps.push({
-        tool: "batch_commit",
-        args: { files: pendingWrites.map((w) => w.path) },
-        ok: true,
-        summary: `✓ Committed ${applied} file(s) atomically (batch ID: ${batch_id})`,
-      });
 
-      // Notify WorkspacePanel to auto-refresh its file list and highlight written files.
-      // Uses a plain window CustomEvent — no Tauri required, works in both dev and prod.
-      window.dispatchEvent(new CustomEvent("nikolai:batch-committed", {
-        detail: {
-          batch_id,
-          applied,
-          files: pendingWrites.map((w) => w.path),
-        },
-      }));
+      // ── Verify each file was actually written ─────────────────────────────
+      let verifyError: string | null = null;
+      for (const w of pendingWrites) {
+        try {
+          const read = await invoke<string>("ws_read_text", { rel: w.path });
+          if (read !== w.content) {
+            verifyError = `Content mismatch: ${w.path}`;
+            break;
+          }
+        } catch (e: any) {
+          verifyError = `Read-back failed: ${w.path} (${e?.message || String(e)})`;
+          break;
+        }
+      }
+
+      if (verifyError) {
+        const rb = await rollbackBatch(batch_id, opts.onStatus);
+        const rbMsg = rb
+          ? `Rolled back: ${rb.restored} file(s) restored, ${rb.deleted} new file(s) removed.`
+          : "⚠️ Rollback also failed — check workspace manually.";
+
+        steps.push({
+          tool: "batch_commit",
+          args: { files: pendingWrites.map((w) => w.path) },
+          ok: false,
+          summary: `✗ Verification failed: ${verifyError}. ${rbMsg}`,
+        });
+
+        opts.onToken(
+          `
+
+⚠️ **Write verification failed — rollback executed.**
+
+` +
+          `**Error:** ${verifyError}
+
+` +
+          `**${rbMsg}**
+
+`
+        );
+      } else {
+        steps.push({
+          tool: "batch_commit",
+          args: { files: pendingWrites.map((w) => w.path) },
+          ok: true,
+          summary: `✓ Committed ${applied} file(s) atomically (batch ID: ${batch_id})`,
+        });
+
+        // Notify WorkspacePanel to auto-refresh its file list and highlight written files.
+        // Uses a plain window CustomEvent — no Tauri required, works in both dev and prod.
+        window.dispatchEvent(new CustomEvent("nikolai:batch-committed", {
+          detail: {
+            batch_id,
+            applied,
+            files: pendingWrites.map((w) => w.path),
+          },
+        }));
+      }
     } else {
       const rb = await rollbackBatch(null, opts.onStatus);
       const rbMsg = rb
@@ -611,6 +982,32 @@ export async function agenticStreamChat(opts: {
         `**${rbMsg}**\n\n`
       );
     }
+  } else if (!batchMode) {
+    steps.push({
+      tool: "batch_commit",
+      args: {},
+      ok: true,
+      summary: "✓ Batch mode off (direct writes); no atomic commit required.",
+    });
+  } else if (batchMode) {
+    // batchMode is ON but nothing was staged — likely the model chose read-only
+    // tools only, OR all fs.write_file calls failed path validation.
+    // Only warn in batch mode; if batchMode is false, writes went through MCP
+    // directly and no commit was needed — no warning required.
+    const hadWriteAttempt = steps.some((s) =>
+      s.tool === "fs.write_file" || s.tool.startsWith("fs.write_file")
+    );
+    if (hadWriteAttempt) {
+      console.warn("[agentic] fs.write_file was called but nothing was staged (path error).");
+      steps.push({
+        tool: "batch_commit",
+        args: { files: [] },
+        ok: false,
+        summary: "✗ No files were staged — check the fs.write_file path errors above.",
+      });
+      opts.onToken("\n\n⚠️ **No files were staged** — all `fs.write_file` calls failed path validation. Check the action steps above.\n\n");
+    }
+    // If no write was attempted (read-only task) — stay silent, no commit needed.
   }
 
   // ── Final streaming answer ────────────────────────────────────────────────
@@ -618,29 +1015,64 @@ export async function agenticStreamChat(opts: {
   if (opts.signal.aborted) throw Object.assign(new Error("Aborted"), { name: "AbortError" });
 
   if (steps.length > 0) {
-    const lines = steps.map((s) => `- ${s.summary}`).join("\n");
+    // Serialize steps — append ||{json} metadata so ChatCenter can show
+    // expanded diffs without an extra IPC call. The || separator is safe
+    // because humanSummary() never produces that character.
+    const lines = steps.map((s) => {
+      const meta: Record<string, any> = {};
+
+      // File path — present for most fs.* tools
+      if (typeof s.args?.path === "string" && s.args.path)
+        meta.path = s.args.path;
+
+      // Write content — what the agent actually wrote (first 2000 chars)
+      if (
+        (s.tool === "fs.write_file" || s.tool === "fs.edit_file") &&
+        typeof s.args?.content === "string"
+      ) {
+        meta.contentPreview = s.args.content.slice(0, 2000);
+        meta.contentLength  = s.args.content.length;
+        meta.truncated      = s.args.content.length > 2000;
+      }
+
+      // Batch commit — list of written files
+      if (s.tool === "batch_commit" && Array.isArray(s.args?.files))
+        meta.files = s.args.files;
+
+      const suffix = Object.keys(meta).length > 0 ? `||${JSON.stringify(meta)}` : "";
+      return `- ${s.summary}${suffix}`;
+    }).join("\n");
+
     opts.onToken(`**Actions taken:**\n${lines}\n\n---\n\n`);
   }
 
   const finalSystem: OllamaMsg = {
     role: "system",
     content:
-      `You are a helpful assistant. Synthesize the tool results into a clear, human-readable answer.\n` +
-      `Be specific — reference actual file names, paths, and data you found.\n` +
-      `Do NOT output JSON. Do NOT suggest using tools again — they have already run.\n` +
-      `If batch commit succeeded, confirm which files were written and their paths.\n` +
-      `If errors occurred, explain what failed and offer concrete alternatives.`,
+      `You are a helpful assistant summarising completed tool work.\n` +
+      `The tools have already run. The results are in the conversation above.\n` +
+      `CRITICAL: Base your answer ONLY on what the tool results actually showed.\n` +
+      `Do NOT say the workspace has no filesystem — tool results prove it does.\n` +
+      `Do NOT say files don't exist if a tool successfully read or listed them.\n` +
+      `Do NOT output JSON. Do NOT suggest running tools again.\n` +
+      `If a batch commit succeeded, list which files were written and their paths.\n` +
+      `If something failed, explain concretely what failed and offer alternatives.\n` +
+      `Be specific: reference actual filenames, paths, and content you found.`,
   };
 
   // Use trimmed context for final answer too — avoids overloading the model
   // with all the tool results again (the steps summary covers them)
   const finalConvo = trimContext(convo);
 
-  await ollamaStreamChat({
-    baseUrl: opts.baseUrl,
-    model: opts.model,
-    messages: [finalSystem, ...finalConvo],
-    signal: opts.signal,
-    onToken: opts.onToken,
-  });
+  if (opts.streamFn) {
+    await opts.streamFn([finalSystem, ...finalConvo], opts.signal, opts.onToken);
+  } else {
+    await ollamaStreamChat({
+      baseUrl: opts.baseUrl,
+      model: opts.model,
+      messages: [finalSystem, ...finalConvo],
+      signal: opts.signal,
+      onToken: opts.onToken,
+    });
+  }
 }
