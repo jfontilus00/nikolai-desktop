@@ -53,10 +53,41 @@ export async function mcpListTools(): Promise<McpTool[]> {
   if (!isTauri()) throw new Error("Not running in Tauri");
   return await invoke("mcp_list_tools");
 }
-export async function mcpCallTool(name: string, args: any): Promise<any> {
+
+// ── mcpCallTool — now accepts an optional AbortSignal ────────────────────────
+//
+// Pre-flight: rejects immediately if signal is already aborted before invoke.
+// In-flight:  races the Tauri invoke against the signal — JS chain cleans up
+//             as soon as the signal fires, without waiting for the full timeout.
+//
+// Caveat: the Rust command handler always runs to completion — Tauri does not
+// support JS-side cancellation of in-flight IPC calls. What this prevents is
+// promise chains accumulating and hanging on the JS side over long sessions.
+//
+export async function mcpCallTool(name: string, args: any, signal?: AbortSignal): Promise<any> {
   if (!isTauri()) throw new Error("Not running in Tauri");
-  return await invoke("mcp_call_tool", { name, args });
+
+  // Pre-flight check — don't even start if already cancelled
+  if (signal?.aborted) {
+    throw Object.assign(new Error("Aborted"), { name: "AbortError" });
+  }
+
+  const invokePromise = invoke("mcp_call_tool", { name, args });
+
+  // No signal — return invoke directly (same behaviour as before)
+  if (!signal) return invokePromise;
+
+  // Race invoke against abort signal
+  return new Promise<any>((resolve, reject) => {
+    const onAbort = () => reject(Object.assign(new Error("Aborted"), { name: "AbortError" }));
+    signal.addEventListener("abort", onAbort, { once: true });
+    invokePromise.then(
+      (v) => { signal.removeEventListener("abort", onAbort); resolve(v); },
+      (e) => { signal.removeEventListener("abort", onAbort); reject(e); },
+    );
+  });
 }
+
 export async function listenMcpState(cb: (payload: McpStatePayload) => void): Promise<UnlistenFn> {
   if (!isTauri()) return () => {};
   return await listen("mcp://state", (event) => cb(event.payload as any));
@@ -300,16 +331,6 @@ export async function disconnect(suppressAutoReconnect = false): Promise<void> {
   }
 }
 
-// ── Priority 5: getCachedTools ────────────────────────────────────────────────
-//
-// Returns the already-loaded tool list directly from the in-memory store.
-//
-// BEFORE: the /tools command called mcpListTools() — a full MCP round-trip
-// every single time, even though the tools were already loaded.
-//
-// AFTER: /tools reads getCachedTools() from the store (instant, no I/O).
-// Use refreshTools() only when you actually want to re-fetch from the server.
-//
 export function getCachedTools(): McpTool[] {
   return store.toolsRaw;
 }

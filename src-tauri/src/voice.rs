@@ -284,7 +284,7 @@ pub fn voice_stop_servers() -> Result<String, String> {
 /// can find espeak-ng.dll, piper_phonemize.dll, onnxruntime.dll.
 /// Model is read from voice/voices/en_US-lessac-medium.onnx.
 #[tauri::command]
-pub async fn voice_tts_speak(app: AppHandle, text: String) -> Result<Vec<u8>, String> {
+pub async fn voice_tts_speak(app: AppHandle, text: String, speed: Option<f32>) -> Result<Vec<u8>, String> {
   let dir     = voice_data_dir(&app);
   let bin     = piper_exe(&dir);
   let mdl     = piper_model(&dir);
@@ -312,11 +312,15 @@ pub async fn voice_tts_speak(app: AppHandle, text: String) -> Result<Vec<u8>, St
     .unwrap_or_default().as_millis();
   let tmp_wav = run_dir.join(format!("tts_{}.wav", ts));
 
+  // length_scale = 1/speed: speed=2.0 → ls=0.50 (twice as fast), speed=0.5 → ls=2.0 (slower)
+  let length_scale = format!("{:.2}", 1.0_f32 / speed.unwrap_or(1.0).max(0.1));
+
   let mut child = Command::new(&bin)
     .args([
       "--model",            mdl.to_str().unwrap_or(""),
       "--output_file",      tmp_wav.to_str().unwrap_or(""),
       "--sentence_silence", "0.1",
+      "--length_scale",     &length_scale,
       "--quiet",
     ])
     .stdin(Stdio::piped())

@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { ChatThread, Message } from "../types";
 import { useMcp } from "../lib/mcp";
+import { copyText } from "../lib/clipboard";
 
 // Tauri event listener — guarded so it doesn't crash in plain browser dev mode
 const isTauri = typeof window !== "undefined" && !!(window as any).__TAURI__;
@@ -50,10 +51,6 @@ function guardIdentityDisplay(text: string) {
   const lines = s.split(/\r?\n/);
   lines[0] = "I'm NikolAi (Atelier NikolAi Desktop). How can I help?";
   return lines.join("\n");
-}
-
-async function copyToClipboard(text: string) {
-  try { await navigator.clipboard.writeText(text); return true; } catch { return false; }
 }
 
 // ── V3: Image helpers ─────────────────────────────────────────────────────────
@@ -260,7 +257,7 @@ function CodeBlock({ code }: { code: string }) {
       <button
         className="absolute top-2 right-2 text-[11px] px-2 py-1 rounded bg-white/10 hover:bg-white/15 border border-white/10"
         onClick={async () => {
-          if (await copyToClipboard(code)) { setCopied(true); setTimeout(() => setCopied(false), 1200); }
+          if (await copyText(code)) { setCopied(true); setTimeout(() => setCopied(false), 1200); }
         }}
       >
         {copied ? "Copied" : "Copy"}
@@ -401,9 +398,10 @@ function ToolStepCard({ step }: { step: ActionStep }) {
                   className="text-[10px] px-2 py-0.5 rounded bg-white/8 hover:bg-white/12 border border-white/10 text-white/50"
                   onClick={async (e) => {
                     e.stopPropagation();
-                    await copyToClipboard(step.contentPreview!);
-                    setCopied(true);
-                    setTimeout(() => setCopied(false), 1200);
+                    if (await copyText(step.contentPreview!)) {
+                      setCopied(true);
+                      setTimeout(() => setCopied(false), 1200);
+                    }
                   }}
                 >
                   {copied ? "Copied!" : "Copy"}
@@ -493,6 +491,10 @@ export default function ChatCenter({
 }: Props) {
   const [text, setText] = useState("");
   const endRef = useRef<HTMLDivElement | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const atBottomRef = useRef(true);
+  const rafRef = useRef<number | null>(null);
+  const [showJumpToBottom, setShowJumpToBottom] = useState(false);
 
   // ── V3: Image attachments ───────────────────────────────────────────────────
   // pendingImages: base64 strings (no data: prefix — Ollama wants raw base64)
@@ -596,8 +598,53 @@ export default function ChatCenter({
   }, [error, connected]);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    atBottomRef.current = true;
+    setShowJumpToBottom(false);
+  }, [chat?.id]);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    if (atBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [chat?.messages.length]);
+
+  useEffect(() => {
+    if (!isStreaming) {
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      return;
+    }
+
+    let stopped = false;
+    const tick = () => {
+      if (stopped) return;
+      const el = scrollRef.current;
+      if (el && atBottomRef.current) {
+        el.scrollTop = el.scrollHeight;
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+    return () => {
+      stopped = true;
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, [isStreaming]);
+
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    atBottomRef.current = atBottom;
+    setShowJumpToBottom((prev) => (prev !== !atBottom ? !atBottom : prev));
+  };
 
   if (!chat) {
     return <div className="h-full flex items-center justify-center text-sm opacity-70">Create a chat from the left panel.</div>;
@@ -723,7 +770,11 @@ export default function ChatCenter({
       )}
 
       {/* ── Messages ── */}
-      <div className="flex-1 overflow-auto p-4 space-y-6">
+      <div
+        ref={scrollRef}
+        onScroll={onScroll}
+        className="flex-1 overflow-auto p-4 space-y-6 relative"
+      >
         {chat.messages.map((m, idx) => (
           <MessageBubble
             key={m.id}
@@ -734,6 +785,20 @@ export default function ChatCenter({
           />
         ))}
         <div ref={endRef} />
+        {showJumpToBottom && (
+          <button
+            type="button"
+            className="absolute bottom-4 right-4 px-3 py-1.5 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-xs"
+            onClick={() => {
+              const el = scrollRef.current;
+              atBottomRef.current = true;
+              setShowJumpToBottom(false);
+              if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+            }}
+          >
+            Jump to bottom
+          </button>
+        )}
       </div>
 
       {/* ── Priority 4: Floating agent status + live tool progress ── */}
@@ -1010,7 +1075,7 @@ function MessageBubble({
           <div className="absolute top-2 right-2 flex gap-2">
             <button
               className="text-[11px] px-2 py-1 rounded bg-white/10 hover:bg-white/15 border border-white/10"
-              onClick={() => copyToClipboard(content)}
+              onClick={() => copyText(content)}
             >
               Copy
             </button>

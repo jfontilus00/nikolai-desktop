@@ -55,8 +55,8 @@ const MAX_PLAN_PARSE_RETRIES = 2;
 // We keep: all original user messages (the goal) + last KEEP_LAST_TOOL_RESULTS
 // tool exchange messages. Everything older is dropped.
 //
-const MAX_CONTEXT_CHARS     = 12_000; // ~3000 tokens — safe headroom for most 8B models
-const KEEP_LAST_TOOL_RESULTS = 8;     // keep last 8 tool results — enough for 9-file tasks to remember all staged writes
+const MAX_CONTEXT_CHARS     = 10_000; // ~2500 tokens — safe headroom for most 8B models
+const KEEP_LAST_TOOL_RESULTS = 4;     // keep last 4 tool result messages
 
 // ── Tool blocklist ────────────────────────────────────────────────────────────
 
@@ -69,7 +69,171 @@ function isAgentTool(name: string): boolean {
   return !BLOCKED_TOOL_PATTERNS.some((p) => p.test(name));
 }
 
-// ── Tauri guard ───────────────────────────────────────────────────────────────
+// ── Tool name aliasing ────────────────────────────────────────────────────────
+//
+// Models frequently emit bare names ("list_directory") instead of qualified
+// names ("fs.list_directory"). This resolver maps known bare names to their
+// qualified equivalents, and also does suffix-match for unique tool names.
+//
+// Priority: explicit map > unique suffix match > unchanged
+//
+function toKebabCase(s: string): string {
+  return s
+    .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
+    .replace(/[_\s]+/g, "-")
+    .replace(/-+/g, "-")
+    .toLowerCase();
+}
+
+function toCamelCase(s: string): string {
+  const parts = s
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .split(/[_-]+/g)
+    .filter(Boolean);
+  if (parts.length === 0) return s;
+  return parts[0].toLowerCase() + parts.slice(1).map((p) => p[0].toUpperCase() + p.slice(1).toLowerCase()).join("");
+}
+
+function buildToolAliasMap(tools: McpTool[]): Record<string, string> {
+  // Build alias candidates, then prune any that are ambiguous (2+ tools claim them).
+  // Ambiguous aliases fall through to the suffix-match in resolveToolName.
+  const candidates = new Map<string, string[]>(); // alias -> [tool names that want it]
+
+  function register(alias: string, full: string) {
+    if (!alias) return;
+    const existing = candidates.get(alias);
+    if (existing) { if (!existing.includes(full)) existing.push(full); }
+    else candidates.set(alias, [full]);
+  }
+
+  for (const t of tools) {
+    const name = t.name;
+    const base = name.split(".").pop() ?? name;
+    register(name, name);
+    register(base, name);
+    register(toKebabCase(base), name);
+    register(toCamelCase(base), name);
+  }
+
+  // Shorthand overrides — only add if unambiguous
+  const has = (n: string) => tools.some((t) => t.name === n);
+  if (has("fs.list_directory")) register("ls",   "fs.list_directory");
+  if (has("fs.read_file"))      register("cat",  "fs.read_file");
+  if (has("fs.search_files"))   register("grep", "fs.search_files");
+
+  // Only keep aliases that resolve to exactly one tool
+  const map: Record<string, string> = {};
+  for (const [alias, owners] of candidates) {
+    if (owners.length === 1) map[alias] = owners[0];
+    // else: ambiguous — leave it out, suffix-match in resolveToolName handles it
+  }
+  return map;
+}
+
+function resolveToolName(name: string, tools: McpTool[], aliasMap: Record<string, string>): string {
+  // 1. Exact match — already correct
+  if (tools.some((t) => t.name === name)) return name;
+
+  // 2. Explicit alias map
+  if (aliasMap[name]) {
+    const aliased = aliasMap[name];
+    if (tools.some((t) => t.name === aliased)) return aliased;
+  }
+
+  // 3. Unique suffix match: if exactly one tool ends with ".{bare}", use it
+  const bare = name.split(".").pop() ?? name;
+  const matches = tools.filter((t) => t.name.endsWith(`.${bare}`) || t.name === bare);
+  if (matches.length === 1) return matches[0].name;
+
+  // 4. Return unchanged — will be caught as "tool not found" below
+  return name;
+}
+
+function normalizeToolArgs(toolName: string, rawArgs: any): { args: any; error?: string } {
+  let args = rawArgs;
+
+  if (args == null) args = {};
+
+  if (typeof args === "string") {
+    const t = args.trim();
+    if (t.startsWith("{") || t.startsWith("[")) {
+      try {
+        args = JSON.parse(t);
+      } catch (e: any) {
+        return { args: {}, error: `Tool args JSON parse failed: ${e?.message || String(e)}` };
+      }
+    } else {
+      return { args: {}, error: "Tool args must be an object." };
+    }
+  }
+
+  if (typeof args !== "object") {
+    return { args: {}, error: "Tool args must be an object." };
+  }
+
+  const a = { ...(args as any) };
+
+  if (toolName.startsWith("fs.")) {
+    if (a.path == null) {
+      if (a.file != null) a.path = a.file;
+      if (a.filepath != null) a.path = a.filepath;
+      if (a.dir != null) a.path = a.dir;
+      if (a.directory != null) a.path = a.directory;
+      if (a.folder != null) a.path = a.folder;
+    }
+
+    if (toolName === "fs.search_files") {
+      if (a.query == null) {
+        if (a.pattern != null) a.query = a.pattern;
+        if (a.search != null) a.query = a.search;
+      }
+    }
+
+    if (toolName === "fs.write_file") {
+      if (a.content == null) {
+        if (typeof a.text === "string") a.content = a.text;
+        if (typeof a.data === "string") a.content = a.data;
+      }
+    }
+
+    if (toolName === "fs.copy_file" || toolName === "fs.move_file" || toolName === "fs.rename_file") {
+      if (Array.isArray(a.paths)) {
+        if (a.src == null) a.src = a.paths[0];
+        if (a.dst == null) a.dst = a.paths[1];
+        if (a.from == null) a.from = a.paths[0];
+        if (a.to == null) a.to = a.paths[1];
+        if (a.source == null) a.source = a.paths[0];
+        if (a.destination == null) a.destination = a.paths[1];
+      }
+    }
+
+    const missing: string[] = [];
+    if (["fs.read_file", "fs.list_directory", "fs.create_directory", "fs.delete_file", "fs.edit_file"].includes(toolName)) {
+      if (!a.path) missing.push("path");
+    }
+    if (toolName === "fs.search_files") {
+      if (!a.path) missing.push("path");
+      if (!a.query) missing.push("query");
+    }
+    if (toolName === "fs.write_file") {
+      if (!a.path) missing.push("path");
+      if (typeof a.content !== "string") missing.push("content");
+    }
+    if (toolName === "fs.copy_file" || toolName === "fs.move_file" || toolName === "fs.rename_file") {
+      const src = a.src ?? a.from ?? a.source;
+      const dst = a.dst ?? a.to ?? a.destination;
+      if (!src) missing.push("src");
+      if (!dst) missing.push("dst");
+    }
+    if (missing.length) {
+      return { args: a, error: `Missing required args: ${missing.join(", ")}` };
+    }
+  }
+
+  return { args: a };
+}
+
+
 
 function isTauri(): boolean {
   return typeof window !== "undefined" &&
@@ -381,13 +545,14 @@ function toolCatalog(tools: McpTool[], hasSemanticIndex: boolean, hasWorkspaceRo
 async function runTool(opts: {
   toolName: string;
   args: any;
-  exec: (name: string, args: any) => Promise<any>;
+  exec: (name: string, args: any, signal?: AbortSignal) => Promise<any>;
   onStatus?: (s: string) => void;
+  signal?: AbortSignal;
 }): Promise<{ ok: boolean; text: string }> {
   opts.onStatus?.(humanStatus(opts.toolName, opts.args));
 
   try {
-    const out = await opts.exec(opts.toolName, opts.args ?? {});
+    const out = await opts.exec(opts.toolName, opts.args ?? {}, opts.signal);
     const formatted = formatToolResult(opts.toolName, out);
 
     appendToolLog({
@@ -469,7 +634,7 @@ export async function agenticStreamChat(opts: {
   onToken: (t: string) => void;
   onStatus?: (s: string) => void;
   maxSteps?: number;
-  executeTool?: (name: string, args: any) => Promise<any>;
+  executeTool?: (name: string, args: any, signal?: AbortSignal) => Promise<any>;
   plannerModel?: string;
   // Optional overrides — allows non-Ollama providers (Anthropic, OpenAI, etc.)
   // to drive the agentic loop. When omitted, defaults to ollamaChat/ollamaStreamChat.
@@ -506,10 +671,61 @@ export async function agenticStreamChat(opts: {
     return;
   }
 
+  let aliasMap = buildToolAliasMap(tools);
+
   // Determine batch mode (workspace root required)
   let workspaceRoot = await getWorkspaceRoot();
   let batchMode = workspaceRoot != null;
   const pendingWrites: PendingWrite[] = [];
+
+  // ── Workspace preflight ───────────────────────────────────────────────────
+  // Before the loop starts, verify the workspace root is actually accessible
+  // by the MCP filesystem server (inside its allowed directories).
+  //
+  // This catches the #1 failure mode: root is set to C:/myproject but the MCP
+  // server's allowed dirs are C:/Dev — every fs.* call silently fails.
+  // We catch it here with a clear message rather than burning all 12 steps.
+  if (batchMode && workspaceRoot && opts.executeTool) {
+    opts.onStatus?.("🔍 Checking workspace access…");
+    try {
+      // Ask the FS server what directories it's allowed to access
+      const allowedResult = await silentTool(opts.executeTool, "fs.list_allowed_directories", {});
+
+      if (allowedResult && allowedResult.trim().length > 0 && !allowedResult.includes("does not exist")) {
+        // Extract paths from the result — handles both line-per-path and JSON array formats
+        const allowedPaths = allowedResult
+          .split(/\r?\n/)
+          .map((l) => l.replace(/^[-\s\[dir\]]+/, "").trim().replace(/\\/g, "/").toLowerCase())
+          .filter((l) => l.length > 3 && !l.startsWith("[") && !l.startsWith("("));
+
+        const normalizedRoot = workspaceRoot.replace(/\\/g, "/").toLowerCase().replace(/\/+$/, "");
+
+        const isUnderAllowed = allowedPaths.some((allowed) => {
+          const normAllowed = allowed.replace(/\/+$/, "");
+          return (
+            normalizedRoot === normAllowed ||
+            normalizedRoot.startsWith(normAllowed + "/")
+          );
+        });
+
+        if (!isUnderAllowed && allowedPaths.length > 0) {
+          const allowedList = allowedPaths.slice(0, 5).join("\n  • ");
+          opts.onToken(
+            `⚠️ **Workspace root is not accessible to the MCP filesystem server.**\n\n` +
+            `**Current root:** \`${workspaceRoot}\`\n\n` +
+            `**MCP allowed directories:**\n  • ${allowedList}\n\n` +
+            `**Fix:** In the Workspace panel, choose a root that is inside one of the allowed directories above, ` +
+            `or update your MCP server config to allow \`${workspaceRoot}\`.\n`
+          );
+          opts.onStatus?.("");
+          return; // abort the run — no point proceeding
+        }
+      }
+    } catch {
+      // preflight is best-effort — if fs.list_allowed_directories doesn't exist, continue
+    }
+    opts.onStatus?.("");
+  }
 
   // ── V4-C: Load session memory ─────────────────────────────────────────────
   const memoryFacts = workspaceRoot ? loadMemory(workspaceRoot) : [];
@@ -613,7 +829,7 @@ export async function agenticStreamChat(opts: {
     if (batchMode && name === "fs.write_file") {
       const content = args?.content ?? "";
       if (!args?.path || typeof content !== "string") {
-        return opts.executeTool!(name, args); // let it fail with a clear error
+        return opts.executeTool!(name, args, opts.signal); // let it fail with a clear error
       }
 
       let path: string;
@@ -644,8 +860,6 @@ export async function agenticStreamChat(opts: {
         args: { path, contentLength: content.length },
         ok: true,
       });
-      // Show live count so user sees progress on multi-file tasks
-      opts.onStatus?.(`💾 ${pendingWrites.length} file(s) staged…`);
       return {
         content: [{ type: "text", text: `Staged: ${path} (${content.length} chars). Will be written atomically at the end.` }],
       };
@@ -678,11 +892,9 @@ export async function agenticStreamChat(opts: {
       const paths = Array.isArray(args?.paths) ? args.paths : null;
       const srcKey = args?.src ?? args?.source ?? args?.from ?? args?.oldPath ?? (paths ? paths[0] : "");
       const dstKey = args?.dst ?? args?.destination ?? args?.to ?? args?.newPath ?? (paths ? paths[1] : "");
-      const srcArg = Object.keys(args).find(k => ["src","source","from","oldPath"].includes(k));
-      const dstArg = Object.keys(args).find(k => ["dst","destination","to","newPath"].includes(k));
 
       if (!srcKey || !dstKey) {
-        return opts.executeTool!(name, args); // pass through if args unclear
+        return opts.executeTool!(name, args, opts.signal); // pass through if args unclear
       }
 
       let srcPath: string, dstPath: string;
@@ -729,15 +941,35 @@ export async function agenticStreamChat(opts: {
           }
         }
       }
-      return opts.executeTool!(name, normalizedArgs);
+      return opts.executeTool!(name, normalizedArgs, opts.signal);
     }
 
-    return opts.executeTool!(name, args);
+    return opts.executeTool!(name, args, opts.signal);
   };
 
   const catalog = toolCatalog(tools, hasSemanticIndex, batchMode);
   const steps: StepRecord[] = [];
   let consecutiveParseFailures = 0;
+  const toolArgErrorOnce = new Set<string>();
+
+  // ── Circuit breaker ───────────────────────────────────────────────────────
+  // If the same tool fails N times in a row, block it for the rest of the run.
+  // Prevents the model from burning all remaining steps on a broken tool.
+  const toolFailCount = new Map<string, number>();
+  const CIRCUIT_BREAK_THRESHOLD = 2;
+  const circuitBroken = new Set<string>();
+
+  function recordToolFailure(toolName: string) {
+    const n = (toolFailCount.get(toolName) ?? 0) + 1;
+    toolFailCount.set(toolName, n);
+    if (n >= CIRCUIT_BREAK_THRESHOLD) {
+      circuitBroken.add(toolName);
+      console.warn(`[agentic] circuit breaker: blocking "${toolName}" after ${n} failures`);
+    }
+  }
+  function recordToolSuccess(toolName: string) {
+    toolFailCount.set(toolName, 0); // reset on success
+  }
 
   // ── V5: Semantic executor ─────────────────────────────────────────────────
   // Wraps batchingExecutor. Intercepts "semantic.find" and handles it locally
@@ -843,7 +1075,23 @@ export async function agenticStreamChat(opts: {
 
     if (plan.action === "final") break;
 
-    const toolName = plan.name;
+    // ── Tool name aliasing ────────────────────────────────────────────────
+    // Resolve bare names (list_directory) → qualified (fs.list_directory).
+    // Do this before any other checks so blocklist/circuit-breaker use real name.
+    const resolvedName = resolveToolName(plan.name, tools, aliasMap);
+    if (resolvedName !== plan.name) {
+      console.log(`[agentic] alias: "${plan.name}" → "${resolvedName}"`);
+    }
+    const toolName = resolvedName;
+
+    // ── Circuit breaker ───────────────────────────────────────────────────
+    if (circuitBroken.has(toolName)) {
+      convo.push({
+        role: "assistant",
+        content: `[tool blocked] "${toolName}" has failed ${CIRCUIT_BREAK_THRESHOLD} times and is blocked for this run. Use a different approach.`,
+      });
+      continue;
+    }
 
     if (!isAgentTool(toolName)) {
       convo.push({ role: "assistant", content: `[tool blocked] "${toolName}" is not available.` });
@@ -852,23 +1100,81 @@ export async function agenticStreamChat(opts: {
 
     // Synthetic tools handled by semanticExecutor — not in the MCP tool list
     const isSynthetic = toolName === "semantic.find" || toolName === "memory.add_fact";
+
+    // ── Self-heal: tool not found → try hub.refresh once ─────────────────
     if (!isSynthetic && !tools.some((t) => t.name === toolName)) {
-      convo.push({ role: "assistant", content: `[tool not found] "${toolName}" does not exist. Choose from the available tools list.` });
+      opts.onStatus?.("🔄 Tool not found — refreshing hub…");
+      try {
+        await semanticExecutor("hub.refresh", {});
+        const refreshed = getCachedTools();
+        if (refreshed.length > 0) {
+          tools = refreshed;
+          aliasMap = buildToolAliasMap(tools);
+        }
+      } catch { /* best-effort */ }
+      opts.onStatus?.("");
+
+      // Re-check after refresh
+      if (!tools.some((t) => t.name === toolName)) {
+        convo.push({
+          role: "assistant",
+          content: `[tool not found] "${toolName}" does not exist even after hub refresh. Available tools: ${tools.slice(0, 8).map((t) => t.name).join(", ")}`,
+        });
+        continue;
+      }
+    }
+
+    const normalized = normalizeToolArgs(toolName, plan.args);
+    if (normalized.error) {
+      const errText = normalized.error;
+      const errKey = `${toolName}:${errText}`;
+      if (!toolArgErrorOnce.has(errKey)) {
+        toolArgErrorOnce.add(errKey);
+        convo.push({
+          role: "assistant",
+          content: `[tool error: ${toolName}]\n${errText}\n\nPlease correct the tool arguments and try again.`,
+        });
+      }
+      recordToolFailure(toolName);
+      steps.push({
+        tool: toolName,
+        args: normalized.args,
+        ok: false,
+        summary: humanSummary(toolName, normalized.args, false, errText),
+      });
       continue;
     }
 
+    const toolArgs = normalized.args;
+
     const result = await runTool({
       toolName,
-      args:     plan.args ?? {},
+      args:     toolArgs,
       exec:     semanticExecutor,   // ← V5: wraps batchingExecutor, intercepts semantic.find
       onStatus: opts.onStatus,
+      signal:   opts.signal,
     });
+
+    if (toolName === "hub.refresh" && result.ok) {
+      const refreshed = getCachedTools();
+      if (refreshed.length > 0) {
+        tools = refreshed;
+        aliasMap = buildToolAliasMap(tools);
+      }
+    }
+
+    // Circuit breaker tracking
+    if (result.ok) {
+      recordToolSuccess(toolName);
+    } else {
+      recordToolFailure(toolName);
+    }
 
     steps.push({
       tool: toolName,
-      args: plan.args ?? {},
+      args: toolArgs,
       ok: result.ok,
-      summary: humanSummary(toolName, plan.args, result.ok, result.text),
+      summary: humanSummary(toolName, toolArgs, result.ok, result.text),
     });
 
     // Append to FULL convo (not trimmed) — trimContext will manage what
@@ -989,25 +1295,15 @@ export async function agenticStreamChat(opts: {
       ok: true,
       summary: "✓ Batch mode off (direct writes); no atomic commit required.",
     });
-  } else if (batchMode) {
-    // batchMode is ON but nothing was staged — likely the model chose read-only
-    // tools only, OR all fs.write_file calls failed path validation.
-    // Only warn in batch mode; if batchMode is false, writes went through MCP
-    // directly and no commit was needed — no warning required.
-    const hadWriteAttempt = steps.some((s) =>
-      s.tool === "fs.write_file" || s.tool.startsWith("fs.write_file")
-    );
-    if (hadWriteAttempt) {
-      console.warn("[agentic] fs.write_file was called but nothing was staged (path error).");
-      steps.push({
-        tool: "batch_commit",
-        args: { files: [] },
-        ok: false,
-        summary: "✗ No files were staged — check the fs.write_file path errors above.",
-      });
-      opts.onToken("\n\n⚠️ **No files were staged** — all `fs.write_file` calls failed path validation. Check the action steps above.\n\n");
-    }
-    // If no write was attempted (read-only task) — stay silent, no commit needed.
+  } else {
+    console.warn("[agentic] No pending writes to commit (staging likely failed).");
+    steps.push({
+      tool: "batch_commit",
+      args: { files: [] },
+      ok: false,
+      summary: "✗ No files were staged, so nothing was committed. Check earlier path errors.",
+    });
+    opts.onToken("\n\n⚠️ No files were staged, so nothing was committed. Check the earlier fs.write_file errors above.\n\n");
   }
 
   // ── Final streaming answer ────────────────────────────────────────────────

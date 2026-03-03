@@ -1,0 +1,376 @@
+C:\Dev\Nikolai-desktop\src\App.tsx:112: type StreamBuffer = {
+C:\Dev\Nikolai-desktop\src\App.tsx:115: chunks: string[];
+C:\Dev\Nikolai-desktop\src\App.tsx:117: pending: boolean;
+C:\Dev\Nikolai-desktop\src\App.tsx:121: const streamingBuffersRef = useRef<Map<string, StreamBuffer>>(new Map());
+C:\Dev\Nikolai-desktop\src\App.tsx:123: const flushStreamingBuffer = useCallback(
+C:\Dev\Nikolai-desktop\src\App.tsx:125: const buffers = streamingBuffersRef.current;
+C:\Dev\Nikolai-desktop\src\App.tsx:127: if (!buf || !buf.pending || buf.chatId !== chatId) return;
+C:\Dev\Nikolai-desktop\src\App.tsx:129: const content = buf.chunks.join("");
+C:\Dev\Nikolai-desktop\src\App.tsx:130: buf.chunks = [];
+C:\Dev\Nikolai-desktop\src\App.tsx:131: buf.pending = false;
+C:\Dev\Nikolai-desktop\src\App.tsx:155: const scheduleFlush = useCallback(
+C:\Dev\Nikolai-desktop\src\App.tsx:157: const buffers = streamingBuffersRef.current;
+C:\Dev\Nikolai-desktop\src\App.tsx:160: buf.rafId = requestAnimationFrame(() => {
+C:\Dev\Nikolai-desktop\src\App.tsx:162: if (b) { b.rafId = null; flushStreamingBuffer(chatId, messageId, false); }
+C:\Dev\Nikolai-desktop\src\App.tsx:165: [flushStreamingBuffer]
+C:\Dev\Nikolai-desktop\src\App.tsx:168: const createStreamingTokenHandler = useCallback(
+C:\Dev\Nikolai-desktop\src\App.tsx:170: const buffers = streamingBuffersRef.current;
+C:\Dev\Nikolai-desktop\src\App.tsx:175: chatId, messageId, chunks: [], rafId: null, pending: false, lastPersist: Date.now(),
+C:\Dev\Nikolai-desktop\src\App.tsx:181: buf.chunks.push(t);
+C:\Dev\Nikolai-desktop\src\App.tsx:182: buf.pending = true;
+C:\Dev\Nikolai-desktop\src\App.tsx:183: scheduleFlush(chatId, messageId);
+C:\Dev\Nikolai-desktop\src\App.tsx:186: [scheduleFlush]
+C:\Dev\Nikolai-desktop\src\App.tsx:189: const finalizeStreaming = useCallback(
+C:\Dev\Nikolai-desktop\src\App.tsx:19: import { ollamaStreamChat } from "./lib/ollamaStream";
+C:\Dev\Nikolai-desktop\src\App.tsx:191: const buffers = streamingBuffersRef.current;
+C:\Dev\Nikolai-desktop\src\App.tsx:195: flushStreamingBuffer(chatId, messageId, true);
+C:\Dev\Nikolai-desktop\src\App.tsx:198: [flushStreamingBuffer]
+C:\Dev\Nikolai-desktop\src\App.tsx:20: import { streamChatWithProvider } from "./lib/providerStream";
+C:\Dev\Nikolai-desktop\src\App.tsx:203: const buffers = streamingBuffersRef.current;
+C:\Dev\Nikolai-desktop\src\App.tsx:209: if (buf.pending && buf.chunks.length > 0) {
+C:\Dev\Nikolai-desktop\src\App.tsx:21: import { agenticStreamChat } from "./lib/agentic";
+C:\Dev\Nikolai-desktop\src\App.tsx:210: const content = buf.chunks.join("");
+C:\Dev\Nikolai-desktop\src\App.tsx:435: setIsStreaming(false);
+C:\Dev\Nikolai-desktop\src\App.tsx:44: const actionVerbs = /\b(read|open|write|create|generate|export|analyse|analyze|refactor|fix|update|edit|search|list|scan|audit|review|check|inspect|summarize|summarise|show|find|look|get|count|rename|move|copy|delete|remove|add|insert|replace|build|run|execute|print|output|display)\b/;
+C:\Dev\Nikolai-desktop\src\App.tsx:506: if (!chat || isStreaming) return;
+C:\Dev\Nikolai-desktop\src\App.tsx:536: setIsStreaming(true);
+C:\Dev\Nikolai-desktop\src\App.tsx:547: const onToken = createStreamingTokenHandler(chat.id, assistantMsgId);
+C:\Dev\Nikolai-desktop\src\App.tsx:554: await streamChatWithProvider({ provider, messages: msgs, signal, onToken: (t: string) => { result += t; } });
+C:\Dev\Nikolai-desktop\src\App.tsx:557: const agenticStreamFn = isOllama ? undefined : async (msgs: any[], signal: AbortSignal, onTok: (t: string) => void) => {
+C:\Dev\Nikolai-desktop\src\App.tsx:558: await streamChatWithProvider({ provider, messages: msgs, signal, onToken: onTok });
+C:\Dev\Nikolai-desktop\src\App.tsx:560: await agenticStreamChat({
+C:\Dev\Nikolai-desktop\src\App.tsx:565: onToken, onStatus,
+C:\Dev\Nikolai-desktop\src\App.tsx:570: streamFn: agenticStreamFn,
+C:\Dev\Nikolai-desktop\src\App.tsx:574: await ollamaStreamChat({ baseUrl: provider.ollamaBaseUrl, model: provider.ollamaModel, messages: baseHistory, signal: controller.signal, onToken });
+C:\Dev\Nikolai-desktop\src\App.tsx:576: await streamChatWithProvider({ provider, messages: baseHistory as any, signal: controller.signal, onToken });
+C:\Dev\Nikolai-desktop\src\App.tsx:581: setIsStreaming(false);
+C:\Dev\Nikolai-desktop\src\App.tsx:583: finalizeStreaming(chat.id, assistantMsgId);
+C:\Dev\Nikolai-desktop\src\App.tsx:603: if (isStreaming) return;
+C:\Dev\Nikolai-desktop\src\App.tsx:706: // -- Chat / agentic stream -------------------------------------------------
+C:\Dev\Nikolai-desktop\src\App.tsx:708: setIsStreaming(true);
+C:\Dev\Nikolai-desktop\src\App.tsx:731: const onToken = createStreamingTokenHandler(chat!.id, assistantMsgId);
+C:\Dev\Nikolai-desktop\src\App.tsx:739: // Build provider-agnostic planner/stream fns so any provider can drive tools
+C:\Dev\Nikolai-desktop\src\App.tsx:742: await streamChatWithProvider({ provider, messages: msgs, signal, onToken: (t: string) => { result += t; } });
+C:\Dev\Nikolai-desktop\src\App.tsx:745: const agenticStreamFn = isOllama ? undefined : async (msgs: any[], signal: AbortSignal, onTok: (t: string) => void) => {
+C:\Dev\Nikolai-desktop\src\App.tsx:746: await streamChatWithProvider({ provider, messages: msgs, signal, onToken: onTok });
+C:\Dev\Nikolai-desktop\src\App.tsx:748: await agenticStreamChat({
+C:\Dev\Nikolai-desktop\src\App.tsx:753: onToken, onStatus,
+C:\Dev\Nikolai-desktop\src\App.tsx:758: streamFn: agenticStreamFn,
+C:\Dev\Nikolai-desktop\src\App.tsx:762: await ollamaStreamChat({ baseUrl: provider.ollamaBaseUrl, model: provider.ollamaModel, messages: historyWithSys, signal: controller.signal, onToken });
+C:\Dev\Nikolai-desktop\src\App.tsx:764: await streamChatWithProvider({ provider, messages: history as any, signal: controller.signal, onToken });
+C:\Dev\Nikolai-desktop\src\App.tsx:770: setIsStreaming(false);
+C:\Dev\Nikolai-desktop\src\App.tsx:772: finalizeStreaming(chat!.id, assistantMsgId);
+C:\Dev\Nikolai-desktop\src\App.tsx:79: const [isStreaming, setIsStreaming] = useState(false);
+C:\Dev\Nikolai-desktop\src\App.tsx:802: isStreaming={isStreaming}
+C:\Dev\Nikolai-desktop\src\App.tsx:805: canRegenerate={!isStreaming}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:1013: onClick={() => copyToClipboard(content)}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:1015: Copy
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:1020: onClick={onRegenerate}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:119: function formatPdfBlock(pdf: PendingPdf): string {
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:126: function downloadMarkdown(filename: string, content: string) {
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:127: const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:18: isStreaming: boolean;
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:2: import ReactMarkdown from "react-markdown";
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:256: function CodeBlock({ code }: { code: string }) {
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:262: onClick={async () => {
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:263: if (await copyToClipboard(code)) { setCopied(true); setTimeout(() => setCopied(false), 1200); }
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:266: {copied ? "Copied" : "Copy"}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:268: <pre className="text-xs whitespace-pre overflow-x-auto rounded-lg bg-black/40 border border-white/10 p-3">
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:277: <ReactMarkdown
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:278: remarkPlugins={[remarkGfm]}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:285: if (isBlock) return <CodeBlock code={code} />;
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:291: </ReactMarkdown>
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:3: import remarkGfm from "remark-gfm";
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:306: // Detect language for syntax highlighting label
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:310: py: "python", rs: "rust", json: "json", md: "markdown", css: "css",
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:317: className={`flex flex-col rounded-lg border text-[12px] overflow-hidden transition-all ${
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:325: className={`flex items-center gap-2 px-3 py-2 ${hasContent ? "cursor-pointer hover:bg-white/5" : ""}`}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:326: onClick={() => hasContent && setExpanded((v) => !v)}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:402: onClick={async (e) => {
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:403: e.stopPropagation();
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:404: await copyToClipboard(step.contentPreview!);
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:409: {copied ? "Copied!" : "Copy"}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:412: <pre className="text-[10.5px] leading-relaxed bg-black/40 border border-white/8 rounded-md p-3 overflow-x-auto overflow-y-auto max-h-64 whitespace-pre text-white/70 font-mono">
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:455: onClick={() => setCollapsed((v) => !v)}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:486: isStreaming,
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:498: // pendingImages: base64 strings (no data: prefix — Ollama wants raw base64)
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:499: const [pendingImages, setPendingImages] = useState<string[]>([]);
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:503: const [pendingPdfs, setPendingPdfs] = useState<PendingPdf[]>([]);
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:55: async function copyToClipboard(text: string) {
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:56: try { await navigator.clipboard.writeText(text); return true; } catch { return false; }
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:599: endRef.current?.scrollIntoView({ behavior: "smooth" });
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:621: onClick={() => setSystemPromptOpen((v) => !v)}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:631: {isStreaming ? <span className="text-green-300">• streaming</span> : <span className="text-white/30">idle</span>}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:639: onClick={reconnectMcp}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:650: <button type="button" className="px-2 py-0.5 rounded border border-white/10 bg-white/5 hover:bg-white/10" onClick={refreshTools}>
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:657: onClick={() => {
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:660: downloadMarkdown(`${safeTitle}_${ts}.md`, [
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:671: onClick={() => onClearStatus?.()}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:694: onClick={() => {
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:704: onClick={() => setSystemPromptOpen(false)}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:712: onClick={() => {
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:726: <div className="flex-1 overflow-auto p-4 space-y-6">
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:740: {(agentStatus || liveToolName) && isStreaming && (
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:763: {/* -- Pending PDF pills -- */}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:764: {pendingPdfs.length > 0 && (
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:766: {pendingPdfs.map((pdf, i) => (
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:776: onClick={() => setPendingPdfs((prev) => prev.filter((_, j) => j !== i))}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:783: {/* -- Pending image thumbnails -- */}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:784: {pendingImages.length > 0 && (
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:786: {pendingImages.map((b64, i) => (
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:796: onClick={() => setPendingImages((prev) => prev.filter((_, j) => j !== i))}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:815: setPendingImages((prev) => [...prev, ...b64s]);
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:833: setPendingPdfs((prev) => [...prev, ...extracted]);
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:848: onClick={() => fileInputRef.current?.click()}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:849: disabled={isStreaming}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:865: onClick={() => pdfInputRef.current?.click()}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:866: disabled={isStreaming || pdfLoading}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:889: e.preventDefault();
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:890: const hasPdfs   = pendingPdfs.length > 0;
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:891: const hasImages = pendingImages.length > 0;
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:894: const pdfPrefix = hasPdfs ? pendingPdfs.map(formatPdfBlock).join("") : "";
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:895: onSend(pdfPrefix + t, hasImages ? pendingImages : undefined);
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:897: setPendingImages([]);
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:898: setPendingPdfs([]);
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:904: e.preventDefault();
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:905: setPendingImages((prev) => [...prev, ...imgs]);
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:908: onDragOver={(e) => e.preventDefault()}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:910: e.preventDefault();
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:914: setPendingImages((prev) => [...prev, ...imgs]);
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:925: setPendingPdfs((prev) => [...prev, ...extracted]);
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:931: disabled={isStreaming}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:934: {!isStreaming ? (
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:938: onClick={() => {
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:939: const hasPdfs   = pendingPdfs.length > 0;
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:940: const hasImages = pendingImages.length > 0;
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:943: const pdfPrefix = hasPdfs ? pendingPdfs.map(formatPdfBlock).join("") : "";
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:944: onSend(pdfPrefix + t, hasImages ? pendingImages : undefined);
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:946: setPendingImages([]);
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:947: setPendingPdfs([]);
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:949: disabled={!text.trim() && pendingImages.length === 0 && pendingPdfs.length === 0}
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:954: <button type="button" className="rounded-md bg-amber-600 hover:bg-amber-500 px-4 py-2 text-sm font-semibold" onClick={onStop}>
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:96: type PendingPdf = { name: string; text: string; pages: number };
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:98: async function extractPdfText(file: File): Promise<PendingPdf> {
+C:\Dev\Nikolai-desktop\src\components\ChatCenter.tsx:995: //   - Plain answer text (rendered as Markdown below the cards)
+C:\Dev\Nikolai-desktop\src\components\ChatHistory.tsx:102: onClick={onCreate}
+C:\Dev\Nikolai-desktop\src\components\ChatHistory.tsx:107: <div className="space-y-2 overflow-auto h-[calc(100%-3rem)] pr-1">
+C:\Dev\Nikolai-desktop\src\components\ChatHistory.tsx:112: onClick={() => onSelect(c.id)}
+C:\Dev\Nikolai-desktop\src\components\ChatHistory.tsx:141: onClick={() => onSelect(c.id)}
+C:\Dev\Nikolai-desktop\src\components\ChatHistory.tsx:157: onClick={() => {
+C:\Dev\Nikolai-desktop\src\components\ChatHistory.tsx:167: onClick={() => onDelete(c.id)}
+C:\Dev\Nikolai-desktop\src\components\ChatHistory.tsx:197: onClick={onCreate}
+C:\Dev\Nikolai-desktop\src\components\ChatHistory.tsx:206: <div className="flex-1 overflow-auto pr-1 space-y-1">
+C:\Dev\Nikolai-desktop\src\components\ErrorBoundary.tsx:32: private copyDetails = async () => {
+C:\Dev\Nikolai-desktop\src\components\ErrorBoundary.tsx:35: await navigator.clipboard.writeText(txt);
+C:\Dev\Nikolai-desktop\src\components\ErrorBoundary.tsx:38: alert("Copy failed. You can screenshot the error.");
+C:\Dev\Nikolai-desktop\src\components\ErrorBoundary.tsx:50: The app hit a runtime error. You can copy details and reset local app state safely.
+C:\Dev\Nikolai-desktop\src\components\ErrorBoundary.tsx:61: onClick={this.copyDetails}
+C:\Dev\Nikolai-desktop\src\components\ErrorBoundary.tsx:63: Copy details
+C:\Dev\Nikolai-desktop\src\components\ErrorBoundary.tsx:67: onClick={this.resetApp}
+C:\Dev\Nikolai-desktop\src\components\ResizableShell.tsx:108: e.preventDefault();
+C:\Dev\Nikolai-desktop\src\components\ResizableShell.tsx:137: <div className="h-full w-full flex overflow-hidden">
+C:\Dev\Nikolai-desktop\src\components\ResizableShell.tsx:141: <button className={railBtn} onClick={toggleLeft} title="Collapse/Expand">
+C:\Dev\Nikolai-desktop\src\components\ResizableShell.tsx:148: <div className="w-1 cursor-col-resize bg-white/0 hover:bg-white/10 flex-shrink-0" onMouseDown={beginDrag("left")} />
+C:\Dev\Nikolai-desktop\src\components\ResizableShell.tsx:152: <div className="w-1 cursor-col-resize bg-white/0 hover:bg-white/10 flex-shrink-0" onMouseDown={beginDrag("right")} />
+C:\Dev\Nikolai-desktop\src\components\ResizableShell.tsx:157: <button className={railBtn} onClick={toggleRight} title="Collapse/Expand">
+C:\Dev\Nikolai-desktop\src\components\ResizableShell.tsx:39: const overflow = CENTER_MIN - centerAvail;
+C:\Dev\Nikolai-desktop\src\components\ResizableShell.tsx:40: const leftShare  = Math.ceil(overflow / 2);
+C:\Dev\Nikolai-desktop\src\components\ResizableShell.tsx:41: const rightShare = overflow - leftShare;
+C:\Dev\Nikolai-desktop\src\components\RightPanel.tsx:150: e.preventDefault();
+C:\Dev\Nikolai-desktop\src\components\RightPanel.tsx:158: onClick={addEntry}
+C:\Dev\Nikolai-desktop\src\components\RightPanel.tsx:179: onClick={clearAll}
+C:\Dev\Nikolai-desktop\src\components\RightPanel.tsx:185: <div className="max-h-[320px] overflow-auto space-y-1.5 pr-1">
+C:\Dev\Nikolai-desktop\src\components\RightPanel.tsx:202: onClick={() => removeEntry(fact.id)}
+C:\Dev\Nikolai-desktop\src\components\RightPanel.tsx:404: <div className="h-12 flex items-center gap-1 px-2 border-b border-white/10 overflow-x-auto">
+C:\Dev\Nikolai-desktop\src\components\RightPanel.tsx:411: onClick={() => setTab(t)}
+C:\Dev\Nikolai-desktop\src\components\RightPanel.tsx:418: <div className="flex-1 overflow-auto p-3">
+C:\Dev\Nikolai-desktop\src\components\RightPanel.tsx:450: <button className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm" onClick={createProfile}>New</button>
+C:\Dev\Nikolai-desktop\src\components\RightPanel.tsx:451: <button className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm" onClick={renameProfile} disabled={!activeProfileId}>Rename</button>
+C:\Dev\Nikolai-desktop\src\components\RightPanel.tsx:452: <button className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm" onClick={deleteProfile} disabled={!activeProfileId}>Delete</button>
+C:\Dev\Nikolai-desktop\src\components\RightPanel.tsx:503: <button className="px-3 py-2 rounded-md bg-blue-600 hover:bg-blue-500 text-sm font-semibold disabled:opacity-50" onClick={saveApiKey} disabled={!activeProfileId}>Save key</button>
+C:\Dev\Nikolai-desktop\src\components\RightPanel.tsx:504: <button className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm disabled:opacity-50" onClick={clearApiKey} disabled={!activeProfileId}>Clear key</button>
+C:\Dev\Nikolai-desktop\src\components\RightPanel.tsx:515: onClick={refreshModels}
+C:\Dev\Nikolai-desktop\src\components\ToolApprovalModal.tsx:117: <div className="mb-5 rounded-xl bg-white/4 border border-white/8 p-3.5 max-h-52 overflow-auto">
+C:\Dev\Nikolai-desktop\src\components\ToolApprovalModal.tsx:132: onClick={onDeny}
+C:\Dev\Nikolai-desktop\src\components\ToolApprovalModal.tsx:141: onClick={onAllowOnce}
+C:\Dev\Nikolai-desktop\src\components\ToolApprovalModal.tsx:149: onClick={onAllowChat}
+C:\Dev\Nikolai-desktop\src\components\ToolApprovalModal.tsx:46: <div className="w-full max-w-lg rounded-2xl bg-[#0e1117] border border-white/10 shadow-2xl overflow-hidden">
+C:\Dev\Nikolai-desktop\src\components\ToolApprovalModal.tsx:77: onClick={() => setArgsExpanded((v) => !v)}
+C:\Dev\Nikolai-desktop\src\components\ToolApprovalModal.tsx:92: <div className="mt-3 rounded-lg bg-black/30 border border-white/8 p-3 max-h-40 overflow-auto">
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:103: <div className="absolute bottom-full left-0 mb-1 z-50 w-56 bg-black/90 border border-white/20 rounded p-2 text-[11px] opacity-90 pointer-events-none shadow-lg">
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:270: onClick={() => setSubtab(tab)}
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:283: <div className="flex-1 overflow-auto">
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:289: <div className="flex-1 overflow-auto p-3 space-y-3">
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:301: onClick={refreshTools}
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:309: onClick={handleDisconnect}
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:330: onClick={() => setConfigOpen((v) => !v)}
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:361: onClick={fn as () => void}
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:394: <label className="flex items-center gap-2 text-xs text-white/60 pt-0.5 cursor-pointer select-none">
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:407: onClick={handleConnect}
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:414: onClick={handleDisconnect}
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:447: onClick={() => toggleGroup(ns)}
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:467: onClick={() => onInsertToComposer?.(`/tool ${tool.name} {}`)}
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:502: <div className="divide-y divide-white/5 max-h-48 overflow-y-auto">
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:88: function ToolButton({ tool, onClick }: { tool: McpTool; onClick: () => void }) {
+C:\Dev\Nikolai-desktop\src\components\ToolsPanel.tsx:96: onClick={onClick}
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:113: const chunksRef = useRef<BlobPart[]>([]);
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:115: const streamRef = useRef<MediaStream | null>(null);
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:167: e.preventDefault();
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:174: e.preventDefault();
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:198: function setupVad(stream: MediaStream) {
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:203: const src     = ctx.createMediaStreamSource(stream);
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:239: const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:240: streamRef.current = stream;
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:242: if (s.vadEnabled) setupVad(stream);
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:244: const rec = new MediaRecorder(stream);
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:246: chunksRef.current = [];
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:247: rec.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunksRef.current.push(e.data); };
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:252: const blob = new Blob(chunksRef.current, { type: rec.mimeType || "audio/webm" });
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:284: try { streamRef.current?.getTracks()?.forEach((t) => t.stop()); } catch {}
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:285: recRef.current = null; streamRef.current = null;
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:402: onClick={startServers}
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:412: onClick={stopServers}
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:433: onClick={loadDownloadInfo}
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:456: target="_blank"
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:573: onClick={async () => {
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:585: <button type="button" className="px-3 py-2 rounded-md bg-blue-600 hover:bg-blue-500 text-sm font-semibold" onClick={startRec}>
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:589: <button type="button" className="px-3 py-2 rounded-md bg-red-600 hover:bg-red-500 text-sm font-semibold" onClick={stopRec}>
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:620: onClick={async () => {
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:640: onClick={async () => {
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:656: onClick={() => { try { ttsStop(); } catch {} }}>
+C:\Dev\Nikolai-desktop\src\components\VoicePanel.tsx:660: onClick={speakCustom}>
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:102: // Highlight written files (just the basename for matching)
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:104: setHighlightedFiles(names);
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:105: setTimeout(() => setHighlightedFiles(new Set()), 4000);
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:238: if (!saved) setIndexError("? Index built but localStorage is full — some chunks were dropped.");
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:472: onClick={chooseRoot}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:495: onClick={() => void refreshDir(cwd)}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:503: onClick={() => {
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:515: onClick={() => void newFolder()}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:523: onClick={() => void newFile()}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:535: <div className="max-h-52 overflow-auto">
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:544: highlightedFiles.has(e.name)
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:548: onClick={() => void openEntry(e)}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:552: {highlightedFiles.has(e.name) && (
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:580: onClick={() => void applyChanges()}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:588: onClick={() => setDraft(original)}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:597: <pre className="p-3 text-[11px] overflow-auto whitespace-pre-wrap">{diffText}</pre>
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:639: onClick={() => void applyBatch()}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:648: onClick={() => void rollbackBatch(lastBatchId)}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:666: onClick={() => void rollbackBatch(batchIdInput)}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:692: onClick={() => (backupOpen ? setBackupOpen(false) : void openBackupBrowser())}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:706: <div className="max-h-32 overflow-auto space-y-1">
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:716: onClick={() => void openBackupBatch(b.name)}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:731: <div className="max-h-28 overflow-auto space-y-1">
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:741: onClick={() => void previewBackupFile(f.rel)}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:748: onClick={() => void restoreBackupFile(f.rel, f.name)}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:763: <pre className="max-h-40 overflow-auto text-[10px] bg-black/30 border border-white/10 rounded p-2 whitespace-pre-wrap break-words opacity-80">
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:790: {indexMeta.chunk_count} chunks · {indexMeta.file_count} files · {indexMeta.model}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:819: onClick={() => void startBuildIndex()}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:830: onClick={abortBuildIndex}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:840: onClick={dropIndex}
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:852: <div className="h-1.5 rounded-full bg-white/10 overflow-hidden">
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:87: // We refresh the file list immediately and highlight the written files for 4s.
+C:\Dev\Nikolai-desktop\src\components\WorkspacePanel.tsx:88: const [highlightedFiles, setHighlightedFiles] = useState<Set<string>>(new Set());
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1036: if (pendingWrites.length > 0) {
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1044: args: { files: pendingWrites.map((w) => w.path) },
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1048: opts.onToken("\n\n?? Workspace root changed before commit; staged writes were not committed. Retry your request.\n\n");
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1052: const commitResult = await commitBatch(pendingWrites, opts.onStatus);
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1059: for (const w of pendingWrites) {
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1080: args: { files: pendingWrites.map((w) => w.path) },
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1085: opts.onToken(
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1101: args: { files: pendingWrites.map((w) => w.path) },
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1106: // Notify WorkspacePanel to auto-refresh its file list and highlight written files.
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1112: files: pendingWrites.map((w) => w.path),
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1129: opts.onToken(
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1136: console.warn("[agentic] No pending writes to commit (staging likely failed).");
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1143: opts.onToken("\n\n?? No files were staged, so nothing was committed. Check the earlier fs.write_file errors above.\n\n");
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1146: // -- Final streaming answer ------------------------------------------------
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1179: opts.onToken(`**Actions taken:**\n${lines}\n\n---\n\n`);
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1200: if (opts.streamFn) {
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1201: await opts.streamFn([finalSystem, ...finalConvo], opts.signal, opts.onToken);
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1203: await ollamaStreamChat({
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:1208: onToken: opts.onToken,
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:160: pendingWrites: PendingWrite[],
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:165: onStatus?.(`?? Committing ${pendingWrites.length} file(s) atomically…`);
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:169: files: pendingWrites.map((w) => ({ path: w.path, content: w.content })),
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:175: args: { count: pendingWrites.length, files: pendingWrites.map((w) => w.path) },
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:186: args: { count: pendingWrites.length },
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:25: type PendingWrite = {
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:3: import { ollamaStreamChat } from "./ollamaStream";
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:305: if (toolName === "fs.copy_file")        return `?? Copying ${short(a.src ?? a.from ?? "file")}`;
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:491: `Output EXACTLY ONE JSON object — no other text, no markdown, no explanation.\n\n` +
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:509: export async function agenticStreamChat(opts: {
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:514: onToken: (t: string) => void;
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:520: // to drive the agentic loop. When omitted, defaults to ollamaChat/ollamaStreamChat.
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:522: streamFn?: (messages: OllamaMsg[], signal: AbortSignal, onToken: (t: string) => void) => Promise<void>;
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:527: opts.onToken(`\n\n[agent] No tool executor provided. Tool calls are blocked.\n`);
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:538: opts.onToken(
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:547: opts.onToken(
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:557: const pendingWrites: PendingWrite[] = [];
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:591: opts.onToken(
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:617: const hasSemanticIndex: boolean              = (semanticIndex?.chunks?.length ?? 0) > 0;
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:699: if (pendingWrites.length > 0) {
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:734: pendingWrites.push({ path, content });
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:766: // -- fs.copy_file ? read source via ws_read_text, stage destination write --
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:767: // MCP copy might write to a location outside workspace root.
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:769: if (batchMode && (name === "fs.copy_file" || name === "fs.rename_file" || name === "fs.move_file")) {
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:789: pendingWrites.push({ path: dstPath, content });
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:790: appendToolLog({ id: `tl-copy-${Date.now()}`, ts: Date.now(), tool: name + " [staged]", args: { src: srcPath, dst: dstPath }, ok: true });
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:791: return { content: [{ type: "text", text: `Staged copy: ${srcPath} ? ${dstPath} (${content.length} chars). Will be written atomically.` }] };
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:794: appendToolLog({ id: `tl-copy-err-${Date.now()}`, ts: Date.now(), tool: name, args: { src: srcPath, dst: dstPath }, ok: false, error: errMsg });
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:799: // -- Normalize path args for ALL fs.* tools (copy, move, rename, delete, read, list)
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:89: copy_file:        "fs.copy_file",
+C:\Dev\Nikolai-desktop\src\lib\agentic.ts:904: // Prevents context window overflow on long multi-step tasks. The original
+C:\Dev\Nikolai-desktop\src\lib\ollamaChat.ts:31: stream: false,
+C:\Dev\Nikolai-desktop\src\lib\ollamaStream.ts:107: throw new Error(`Ollama chat stream failed (${r.status}): ${t}`);
+C:\Dev\Nikolai-desktop\src\lib\ollamaStream.ts:111: if (!reader) throw new Error("No response body reader (stream unsupported).");
+C:\Dev\Nikolai-desktop\src\lib\ollamaStream.ts:120: buf += dec.decode(value, { stream: true });
+C:\Dev\Nikolai-desktop\src\lib\ollamaStream.ts:130: if (token) opts.onToken(String(token));
+C:\Dev\Nikolai-desktop\src\lib\ollamaStream.ts:28: export async function ollamaStreamChat(opts: {
+C:\Dev\Nikolai-desktop\src\lib\ollamaStream.ts:33: onToken: (t: string) => void;
+C:\Dev\Nikolai-desktop\src\lib\ollamaStream.ts:52: stream: true,
+C:\Dev\Nikolai-desktop\src\lib\ollamaStream.ts:55: // ? Tauri path: stream via Rust + events (fix MSI/EXE fetch restrictions)
+C:\Dev\Nikolai-desktop\src\lib\ollamaStream.ts:61: if (p?.id === id && p.token) opts.onToken(String(p.token));
+C:\Dev\Nikolai-desktop\src\lib\ollamaStream.ts:88: await invoke("ollama_chat_stream", { id, baseUrl: base, body });
+C:\Dev\Nikolai-desktop\src\lib\ollamaStream.ts:97: // Browser fallback: direct fetch streaming (NDJSON)
+C:\Dev\Nikolai-desktop\src\lib\openaiCompatChat.ts:32: stream: false,
+C:\Dev\Nikolai-desktop\src\lib\openaiCompatStream.ts:15: export async function openaiCompatStreamChat(opts: {
+C:\Dev\Nikolai-desktop\src\lib\openaiCompatStream.ts:21: onToken: (t: string) => void;
+C:\Dev\Nikolai-desktop\src\lib\openaiCompatStream.ts:34: stream: true,
+C:\Dev\Nikolai-desktop\src\lib\openaiCompatStream.ts:42: throw new Error(`OpenAI-compat stream failed (${res.status}): ${txt || res.statusText}`);
+C:\Dev\Nikolai-desktop\src\lib\openaiCompatStream.ts:54: buf += dec.decode(value, { stream: true });
+C:\Dev\Nikolai-desktop\src\lib\openaiCompatStream.ts:72: opts.onToken(delta);
+C:\Dev\Nikolai-desktop\src\lib\providerStream.ts:10: onToken(s.slice(i, i + size));
+C:\Dev\Nikolai-desktop\src\lib\providerStream.ts:14: export async function streamChatWithProvider(opts: {
+C:\Dev\Nikolai-desktop\src\lib\providerStream.ts:18: onToken: (t: string) => void;
+C:\Dev\Nikolai-desktop\src\lib\providerStream.ts:2: import { ollamaStreamChat } from "./ollamaStream";
+C:\Dev\Nikolai-desktop\src\lib\providerStream.ts:23: return await ollamaStreamChat({
+C:\Dev\Nikolai-desktop\src\lib\providerStream.ts:28: onToken: opts.onToken
+C:\Dev\Nikolai-desktop\src\lib\providerStream.ts:3: import { openaiCompatStreamChat } from "./openaiCompatStream";
+C:\Dev\Nikolai-desktop\src\lib\providerStream.ts:36: return await openaiCompatStreamChat({
+C:\Dev\Nikolai-desktop\src\lib\providerStream.ts:42: onToken: opts.onToken
+C:\Dev\Nikolai-desktop\src\lib\providerStream.ts:6: function chunkEmit(text: string, onToken: (t: string) => void) {
+C:\Dev\Nikolai-desktop\src\lib\providerStream.ts:67: chunkEmit(out, opts.onToken);
+C:\Dev\Nikolai-desktop\src\lib\secrets.ts:42: // If we successfully stored securely, remove fallback copy
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:230: const rawChunks: Array<{ path: string; chunk: string; start: number }> = [];
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:238: if (text?.length > 10) rawChunks.push(...chunkFile(rel, text.slice(0, 20_000)));
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:242: if (rawChunks.length === 0) throw new Error("All files were empty or unreadable.");
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:245: const indexChunks: IndexChunk[] = [];
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:247: for (let i = 0; i < rawChunks.length; i++) {
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:249: const { path, chunk, start } = rawChunks[i];
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:253: total:   rawChunks.length,
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:255: message: `Embedding ${i + 1}/${rawChunks.length}  —  ${path}`,
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:259: indexChunks.push({ path, chunk, start, embedding });
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:268: current: indexChunks.length,
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:269: total:   indexChunks.length,
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:271: message: `? Index built — ${indexChunks.length} chunks from ${files.length} files`,
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:274: return { root: opts.root, model, built_at: Date.now(), chunks: indexChunks, file_count: files.length };
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:29: chunks:     IndexChunk[];
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:292: if (!index?.chunks?.length) return [];
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:295: const scored = index.chunks.map((c) => ({
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:304: // Best chunk per file — avoid sending 5 chunks from the same file
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:64: if (e?.name === "QuotaExceededError" && index.chunks.length > 10) {
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:66: const slim = { ...index, chunks: index.chunks.slice(0, Math.floor(index.chunks.length * 0.7)) };
+C:\Dev\Nikolai-desktop\src\lib\semanticIndex.ts:82: return { built_at: idx.built_at, chunk_count: idx.chunks.length, file_count: idx.file_count, model: idx.model };
+C:\Dev\Nikolai-desktop\src\lib\storage.ts:38: // Backup last good copy

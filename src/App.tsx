@@ -40,11 +40,22 @@ function shouldUseAgentic(text: string) {
   // Memory triggers — "remember X", "note that X", "save that X", "forget X"
   if (/\b(remember|note that|save that|forget|add to memory|store this)\b/.test(t)) return true;
 
-  const actionVerbs = /\b(read|open|write|create|generate|export|analyse|analyze|refactor|fix|update|edit|search|list)\b/;
-  const fileNouns   = /\b(file|files|folder|directory|project|codebase|repo|docx|pdf|pptx|xlsx|report|diagram|mermaid|source)\b/;
+  // Action verbs — expanded to cover real-world usage ("scan", "audit", "check", etc.)
+  const actionVerbs = /\b(read|open|write|create|generate|export|analyse|analyze|refactor|fix|update|edit|search|list|scan|audit|review|check|inspect|summarize|summarise|show|find|look|get|count|rename|move|copy|delete|remove|add|insert|replace|build|run|execute|print|output|display)\b/;
+
+  // File/project nouns — expanded
+  const fileNouns = /\b(file|files|folder|folders|directory|directories|project|codebase|repo|repository|docx|pdf|pptx|xlsx|report|diagram|mermaid|source|code|script|module|function|class|component|config|json|yaml|toml|csv|log|logs|readme|package|dependency|dependencies|workspace)\b/;
 
   if (actionVerbs.test(t) && fileNouns.test(t)) return true;
-  if (/\b(ls|grep|cat|find)\b/.test(t)) return true;
+
+  // Shell-style commands
+  if (/\b(ls|grep|cat|find|mv|cp|rm|mkdir|touch|head|tail|wc)\b/.test(t)) return true;
+
+  // Standalone high-intent phrases that clearly need tools — no noun required
+  if (/\b(scan the|audit the|review the|analyse the|analyze the|inspect the|check the|summarize the|summarise the|list all|show all|find all|count all|search for|look for|look at|look in|look through|go through)\b/.test(t)) return true;
+
+  // "what (files|functions|classes|errors|issues|dependencies) ..." pattern
+  if (/\bwhat (files|functions|classes|components|errors|issues|imports|dependencies|modules|routes|endpoints|tests)\b/.test(t)) return true;
 
   return false;
 }
@@ -71,9 +82,32 @@ export default function App() {
   // ── Priority 4: Agent status — ephemeral React state, never in message content
   const [agentStatus, setAgentStatus] = useState<string>("");
 
-  // 20s ceiling — if a tool hangs longer than this the UX is already broken.
-  // 45s was too high; at 10 steps worst-case that was 7.5 minutes of silence.
-  const TOOL_TIMEOUT_MS = 20000;
+  // ── Per-tool timeouts ────────────────────────────────────────────────────
+  // 20s global was too blunt. Long-running tools (exports, analysis, semantic
+  // search) legitimately take 60–180s. FS reads/lists are fast — keep them tight.
+  function getToolTimeout(toolName: string): number {
+    // Slow tools — allow up to 3 minutes
+    if (
+      toolName.includes("project-brain") ||
+      toolName.includes("export_docx") ||
+      toolName.includes("export_pdf") ||
+      toolName.includes("export_pptx") ||
+      toolName.includes("export_xlsx") ||
+      toolName.includes("export_") ||
+      toolName.includes("render_") ||
+      toolName === "semantic.find"
+    ) return 180_000;
+
+    // Medium tools — 60s
+    if (
+      toolName.includes("hub.") ||
+      toolName.includes("analyze") ||
+      toolName.includes("git.")
+    ) return 60_000;
+
+    // Fast FS tools — 20s (network drives can still be slow)
+    return 20_000;
+  }
 
   type StreamBuffer = {
     chatId: string;
@@ -235,57 +269,6 @@ export default function App() {
     return true;
   }
 
-  const FS_LIKE_TOOL_BASES = new Set([
-    "read_file",
-    "write_file",
-    "edit_file",
-    "list_directory",
-    "search_files",
-    "create_directory",
-    "delete_file",
-    "copy_file",
-    "move_file",
-    "rename_file",
-  ]);
-
-  function isFsLikeToolName(toolName: string): boolean {
-    if (!toolName) return false;
-    if (toolName.startsWith("fs.")) return true;
-    const base = toolName.split(".").pop() ?? toolName;
-    return FS_LIKE_TOOL_BASES.has(base);
-  }
-
-  function coerceFileOpArgs(toolName: string, args: any) {
-    const a = args && typeof args === "object" ? { ...args } : {};
-    const base = toolName.split(".").pop() ?? toolName;
-
-    if (base === "copy_file" || base === "move_file" || base === "rename_file") {
-      const paths = Array.isArray(a.paths) ? a.paths : null;
-      const src =
-        a.src ?? a.from ?? a.source ?? a.oldPath ?? (paths ? paths[0] : undefined);
-      const dst =
-        a.dst ?? a.to ?? a.destination ?? a.newPath ?? (paths ? paths[1] : undefined);
-
-      if (typeof src === "string") {
-        if (a.src == null) a.src = src;
-        if (a.from == null) a.from = src;
-        if (a.source == null) a.source = src;
-        if (a.oldPath == null) a.oldPath = src;
-      }
-      if (typeof dst === "string") {
-        if (a.dst == null) a.dst = dst;
-        if (a.to == null) a.to = dst;
-        if (a.destination == null) a.destination = dst;
-        if (a.newPath == null) a.newPath = dst;
-      }
-      if (a.paths == null && typeof src === "string" && typeof dst === "string") {
-        a.paths = [src, dst];
-      }
-    }
-
-    return a;
-  }
-
   // NEW: for Windows, enforce paths stay under workspace root (case-insensitive)
   function toRelUnderRoot(absPath: string, absRoot: string): string | null {
     const root = normalizeWinPath(absRoot).replace(/\/+$/, "");
@@ -303,13 +286,8 @@ export default function App() {
 
   // NEW: enforce fs.* absolute paths must be under wsRoot (and normalize them)
   function enforceFsArgsUnderRoot(toolName: string, args: any, wsRoot?: string | null) {
-    // Apply ONLY to filesystem-like tools (fs.* OR bare write_file/copy_file/etc.)
-    if (!isFsLikeToolName(toolName)) return;
-
-    // Fail-safe: if workspace root is unknown, do not allow filesystem tools to run
-    if (!wsRoot) {
-      throw new Error(`${toolName}: workspace root not available  set workspace root before using filesystem tools.`);
-    }
+    if (!wsRoot) return;
+    if (!toolName.startsWith("fs.")) return;
 
     const root = normalizeWinPath(wsRoot).replace(/\/+$/, "");
     const a = args && typeof args === "object" ? args : {};
@@ -387,10 +365,12 @@ export default function App() {
     return { ok: true };
   }
 
-  const executeToolWithApproval = async (name: string, args: any) => {
+  const executeToolWithApproval = async (name: string, args: any, signal?: AbortSignal) => {
+    // Pre-flight: abort immediately if the run was cancelled before this call
+    if (signal?.aborted) throw Object.assign(new Error("Aborted"), { name: "AbortError" });
+
     const wsRoot = await getWsRoot();
-    const coercedArgs = coerceFileOpArgs(name, args);
-    const normalizedArgs = normalizeFsArgs(name, coercedArgs, wsRoot);
+    const normalizedArgs = normalizeFsArgs(name, args, wsRoot);
 
     // NEW: block absolute paths outside root for fs.* tools
     enforceFsArgsUnderRoot(name, normalizedArgs, wsRoot);
@@ -399,7 +379,7 @@ export default function App() {
     if (!v.ok) throw new Error(`Tool args invalid: ${v.error}`);
 
     if (toolAllowInChat[`${activeId || "nochat"}::${name}`]) {
-      return await withTimeout(mcpCallTool(name, normalizedArgs), TOOL_TIMEOUT_MS, `Tool timeout: ${name}`);
+      return await withTimeout(mcpCallTool(name, normalizedArgs, signal), getToolTimeout(name), `Tool timeout: ${name}`, signal);
     }
 
     const choice = await requestToolApproval(name, normalizedArgs);
@@ -411,7 +391,7 @@ export default function App() {
         return next;
       });
     }
-    return await withTimeout(mcpCallTool(name, normalizedArgs), TOOL_TIMEOUT_MS, `Tool timeout: ${name}`);
+    return await withTimeout(mcpCallTool(name, normalizedArgs, signal), getToolTimeout(name), `Tool timeout: ${name}`, signal);
   };
 
   const activeChat = useMemo(() => chats.find((c) => c.id === activeId) || null, [chats, activeId]);
@@ -583,7 +563,7 @@ export default function App() {
           messages: baseHistory as any,
           signal: controller.signal,
           onToken, onStatus,
-          maxSteps: 12,
+          maxSteps: 10,
           executeTool: executeToolWithApproval,
           plannerModel: ((provider as any)?.ollamaPlannerModel || provider.ollamaModel),
           chatFn: agenticChatFn,
@@ -685,8 +665,7 @@ export default function App() {
       // Resolve relative paths in /tool commands the same way as agentic tool calls
       try {
         const wsRootForCmd = await getWsRoot();
-        const coercedArgs = coerceFileOpArgs(toolCmd.name, toolCmd.args || {});
-        const resolvedArgs = normalizeFsArgs(toolCmd.name, coercedArgs, wsRootForCmd);
+        const resolvedArgs = normalizeFsArgs(toolCmd.name, toolCmd.args || {}, wsRootForCmd);
 
         // NEW: block absolute paths outside root for fs.* tools
         enforceFsArgsUnderRoot(toolCmd.name, resolvedArgs, wsRootForCmd);
@@ -772,7 +751,7 @@ export default function App() {
           messages: historyWithSys as any,
           signal: controller.signal,
           onToken, onStatus,
-          maxSteps: 12,
+          maxSteps: 10,
           executeTool: executeToolWithApproval,
           plannerModel: ((provider as any)?.ollamaPlannerModel || provider.ollamaModel),
           chatFn: agenticChatFn,

@@ -80,8 +80,37 @@ function looksLikeFileContents(s: string): boolean {
   return false;
 }
 
+// ── Detect whether a tool result represents an error ─────────────────────────
+// MCP servers return errors in many shapes. This catches all known patterns
+// so the UI correctly shows "Failed" instead of "Done" for error payloads.
+function detectIsError(out: any): boolean {
+  if (!out || typeof out !== "object") return false;
+
+  // Standard MCP isError flag
+  if (out.isError === true) return true;
+
+  // { ok: false } pattern
+  if (out.ok === false) return true;
+
+  // { error: "..." } pattern (plain string or object)
+  if (typeof out.error === "string" && out.error.trim().length > 0) return true;
+
+  // { status: "error" } pattern
+  if (out.status === "error" || out.status === "failed") return true;
+
+  // MCP content[].isError pattern
+  if (Array.isArray(out.content)) {
+    if (out.content.some((item: any) => item && item.isError === true)) return true;
+    // All-text content that starts with known error prefixes
+    const firstText = out.content.find((item: any) => item && typeof item.text === "string")?.text ?? "";
+    if (/^(Error|error|ERROR|FAILED|failed)[\s:]/m.test(firstText)) return true;
+  }
+
+  return false;
+}
+
 export function formatToolResult(toolName: string, out: any): FormattedToolResult {
-  const isError = !!(out && typeof out === "object" && out.isError);
+  const isError = detectIsError(out);
 
   // Extract MCP-style content[].text if present
   let textParts: string[] = [];

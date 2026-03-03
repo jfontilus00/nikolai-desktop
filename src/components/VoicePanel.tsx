@@ -122,6 +122,8 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
   const vadStartedAtRef      = useRef(0);
 
   const [lastTranscript, setLastTranscript] = useState("");
+  const [micLevel, setMicLevel] = useState(0); // 0-1, updated from VAD RMS loop
+  const [vadAdvanced, setVadAdvanced] = useState(false);
 
   // ── V4: Voice server state ──────────────────────────────────────────────────
   const [serverStatus, setServerStatus] = useState<VoiceServerStatus | null>(null);
@@ -193,6 +195,7 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
     vadSpeechDetectedRef.current = false;
     vadSilenceAccumRef.current   = 0;
     vadStartedAtRef.current      = 0;
+    setMicLevel(0);
   }
 
   async function ping(url: string) {
@@ -227,6 +230,7 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
         let sum = 0;
         for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
         const rms       = Math.sqrt(sum / data.length);
+        setMicLevel(Math.min(1, rms * 12)); // scale 0-1 for display (rms ~0-0.08 in normal speech)
         const threshold = clamp(Number(s.vadThreshold || 0.02), 0.005, 0.2);
         const silenceMs = clamp(Number(s.vadSilenceMs  || 900),  200, 4000);
         const minMs     = clamp(Number(s.vadMinSpeechMs || 600), 0,   5000);
@@ -275,6 +279,20 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
           }
           onInsertToComposer?.(text.endsWith(" ") ? text : text + " ");
           setPhase("idle"); setStatus("Transcript inserted into composer.");
+          // autoListenAfterSpeak: if enabled, wait for TTS to finish then re-listen
+          if (s.autoSpeak) {
+            const speakFn = (window as any).__nikolai_tts_last;
+            if (typeof speakFn === "function") {
+              try {
+                setStatus("Speaking…");
+                await speakFn();
+                setStatus("Done speaking.");
+              } catch { /* ignore TTS errors — don't break the loop */ }
+            }
+          }
+          if (s.autoListenAfterSpeak) {
+            setTimeout(() => startRec().catch(() => {}), 300);
+          }
         } catch (e: any) {
           setPhase("idle"); setStatus(e?.message || String(e));
         }
@@ -353,7 +371,7 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
     phase === "transcribing" ? "Transcribing…" : "Idle";
 
   const whisperOk = serverStatus?.whisper.running ?? false;
-  const piperOk   = serverStatus?.piper.running   ?? false;
+  const piperOk   = (serverStatus?.piper.exe_exists && serverStatus?.piper.model_exists) ?? false;
   const whisperReady = serverStatus?.whisper.exe_exists && serverStatus?.whisper.model_exists;
   const piperReady   = serverStatus?.piper.exe_exists   && serverStatus?.piper.model_exists;
 
@@ -508,11 +526,7 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
               value={s.sttLanguage} onChange={(e) => setS({ ...s, sttLanguage: e.target.value })}
               placeholder="e.g. fr or en" />
           </div>
-          <div className="flex-1">
-            <label className="block text-xs opacity-70">Task</label>
-            <input className="w-full rounded-md bg-black/30 border border-white/10 px-3 py-2 text-sm outline-none focus:border-white/30"
-              value={s.sttTask} onChange={(e) => setS({ ...s, sttTask: e.target.value })} />
-          </div>
+
         </div>
 
         <label className="flex items-center gap-2 text-xs opacity-80">
@@ -549,22 +563,67 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
         </div>
 
         <div className="border-t border-white/10 pt-2 space-y-2">
-          <div className="text-xs font-semibold opacity-80">VAD (auto-stop)</div>
+          <div className="flex items-center justify-between">
+            <div className="text-xs font-semibold opacity-80">VAD (auto-stop)</div>
+            <button
+              type="button"
+              className="text-[10px] opacity-40 hover:opacity-70"
+              onClick={() => setVadAdvanced((v) => !v)}
+            >
+              {vadAdvanced ? "Simple ▲" : "Advanced ▼"}
+            </button>
+          </div>
           <label className="flex items-center gap-2 text-xs opacity-80">
             <input type="checkbox" checked={Boolean(s.vadEnabled)} onChange={(e) => setS({ ...s, vadEnabled: e.target.checked })} />
-            Enable VAD auto-stop on silence
+            Auto-stop on silence
           </label>
-          <div className="grid grid-cols-3 gap-2">
-            <div><label className="block text-xs opacity-70">Threshold</label>
-              <input type="number" step="0.005" className="w-full rounded-md bg-black/30 border border-white/10 px-3 py-2 text-sm outline-none"
-                value={s.vadThreshold} onChange={(e) => setS({ ...s, vadThreshold: Number(e.target.value) })} /></div>
-            <div><label className="block text-xs opacity-70">Silence ms</label>
-              <input type="number" step="100" className="w-full rounded-md bg-black/30 border border-white/10 px-3 py-2 text-sm outline-none"
-                value={s.vadSilenceMs} onChange={(e) => setS({ ...s, vadSilenceMs: Number(e.target.value) })} /></div>
-            <div><label className="block text-xs opacity-70">Min speech ms</label>
-              <input type="number" step="100" className="w-full rounded-md bg-black/30 border border-white/10 px-3 py-2 text-sm outline-none"
-                value={s.vadMinSpeechMs} onChange={(e) => setS({ ...s, vadMinSpeechMs: Number(e.target.value) })} /></div>
-          </div>
+
+          {!vadAdvanced ? (
+            /* ── Preset picker ── */
+            <div className="space-y-1">
+              <label className="block text-xs opacity-70">Environment</label>
+              <div className="grid grid-cols-3 gap-1.5">
+                {([
+                  { label: "Quiet",  desc: "Home/office",   threshold: 0.01, silenceMs: 700,  minSpeechMs: 400  },
+                  { label: "Normal", desc: "Typical",       threshold: 0.02, silenceMs: 900,  minSpeechMs: 600  },
+                  { label: "Noisy",  desc: "Loud room",     threshold: 0.05, silenceMs: 1200, minSpeechMs: 800  },
+                ] as const).map((p) => {
+                  const active =
+                    s.vadThreshold   === p.threshold &&
+                    s.vadSilenceMs   === p.silenceMs  &&
+                    s.vadMinSpeechMs === p.minSpeechMs;
+                  return (
+                    <button
+                      key={p.label}
+                      type="button"
+                      onClick={() => setS({ ...s, vadThreshold: p.threshold, vadSilenceMs: p.silenceMs, vadMinSpeechMs: p.minSpeechMs })}
+                      className={`px-2 py-2 rounded-md border text-xs text-left transition-colors ${
+                        active
+                          ? "border-blue-400/50 bg-blue-500/15 text-blue-300"
+                          : "border-white/10 bg-white/5 hover:bg-white/10 opacity-70"
+                      }`}
+                    >
+                      <div className="font-semibold">{p.label}</div>
+                      <div className="text-[10px] opacity-60">{p.desc}</div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : (
+            /* ── Advanced raw controls ── */
+            <div className="grid grid-cols-3 gap-2">
+              <div><label className="block text-xs opacity-70">Threshold</label>
+                <input type="number" step="0.005" className="w-full rounded-md bg-black/30 border border-white/10 px-3 py-2 text-sm outline-none"
+                  value={s.vadThreshold} onChange={(e) => setS({ ...s, vadThreshold: Number(e.target.value) })} /></div>
+              <div><label className="block text-xs opacity-70">Silence ms</label>
+                <input type="number" step="100" className="w-full rounded-md bg-black/30 border border-white/10 px-3 py-2 text-sm outline-none"
+                  value={s.vadSilenceMs} onChange={(e) => setS({ ...s, vadSilenceMs: Number(e.target.value) })} /></div>
+              <div><label className="block text-xs opacity-70">Min speech ms</label>
+                <input type="number" step="100" className="w-full rounded-md bg-black/30 border border-white/10 px-3 py-2 text-sm outline-none"
+                  value={s.vadMinSpeechMs} onChange={(e) => setS({ ...s, vadMinSpeechMs: Number(e.target.value) })} /></div>
+            </div>
+          )}
         </div>
 
         <div className="border-t border-white/10 pt-2 space-y-2">
@@ -577,6 +636,37 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
           <input className="w-full rounded-md bg-black/30 border border-white/10 px-3 py-2 text-sm outline-none"
             value={s.pttKey} onChange={(e) => setS({ ...s, pttKey: e.target.value })} placeholder="F9" />
         </div>
+
+        {/* ── Mic level meter — only visible while recording ── */}
+        {recording && (
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <div className="flex-1 h-2 rounded-full bg-white/10 overflow-hidden">
+                <div
+                  className="h-full rounded-full transition-none"
+                  style={{
+                    width: `${Math.round(micLevel * 100)}%`,
+                    background: micLevel > 0.75
+                      ? "rgb(248 113 113)"       // red  — clipping
+                      : micLevel > 0.4
+                      ? "rgb(251 191 36)"        // amber — loud
+                      : "rgb(52 211 153)",       // green — normal
+                  }}
+                />
+              </div>
+              <span className="text-[10px] opacity-40 w-6 text-right tabular-nums">
+                {Math.round(micLevel * 100)}
+              </span>
+            </div>
+            <div className="text-[10px] opacity-40">
+              {micLevel < 0.05
+                ? "No signal — check mic privacy settings"
+                : micLevel > 0.75
+                ? "Too loud — move mic further away"
+                : "Good signal ✓"}
+            </div>
+          </div>
+        )}
 
         <div className="flex gap-2">
           <button type="button" className="px-3 py-2 rounded-md bg-white/10 hover:bg-white/15 border border-white/10 text-sm"

@@ -1,4 +1,5 @@
-﻿import React from "react";
+import React from "react";
+import { copyText } from "../lib/clipboard";
 
 type State = {
   hasError: boolean;
@@ -32,8 +33,8 @@ export default class ErrorBoundary extends React.Component<{ children: React.Rea
   private copyDetails = async () => {
     const txt = `Nikolai Desktop crashed\n\n${this.state.message}\n\n${this.state.stack || ""}`;
     try {
-      await navigator.clipboard.writeText(txt);
-      alert("Copied error details.");
+      const ok = await copyText(txt);
+      alert(ok ? "Copied error details." : "Copy failed. You can screenshot the error.");
     } catch {
       alert("Copy failed. You can screenshot the error.");
     }

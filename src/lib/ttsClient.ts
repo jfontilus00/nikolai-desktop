@@ -46,7 +46,7 @@ export async function ttsSpeak(text: string, settings: VoiceSettings): Promise<v
   // voice_tts_speak(text) → Vec<u8> (WAV bytes)
   // No HTTP server needed. Piper is called as a subprocess per request.
   if (isTauri && tauriInvoke) {
-    const wavBytes = await tauriInvoke<number[]>("voice_tts_speak", { text: text.trim() });
+    const wavBytes = await tauriInvoke<number[]>("voice_tts_speak", { text: text.trim(), speed: Number(settings.ttsSpeed ?? 1.0) });
     const blob = new Blob([new Uint8Array(wavBytes)], { type: "audio/wav" });
     const url  = URL.createObjectURL(blob);
 

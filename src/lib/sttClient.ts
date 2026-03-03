@@ -80,8 +80,9 @@ export async function sttTranscribe(
   settings: VoiceSettings,
 ): Promise<string> {
   const base = (settings.sttBaseUrl || "http://127.0.0.1:9900").replace(/\/+$/, "");
-  // Always use /inference — that is the ONLY valid endpoint on whisper-server
-  const url  = `${base}/inference`;
+  const rawPath = (settings.sttPath || "/inference").trim() || "/inference";
+  const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+  const url  = `${base}${path}`;
 
   // Optionally convert to WAV for best compatibility
   let audioBlob = blob;
