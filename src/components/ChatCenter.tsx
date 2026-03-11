@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import type { ChatThread, Message } from "../types";
 import { useMcp } from "../lib/mcp";
 import { copyText } from "../lib/clipboard";
+import { createHighlighter, type Highlighter } from "shiki";
 
 // Tauri event listener — guarded so it doesn't crash in plain browser dev mode
 const isTauri = typeof window !== "undefined" && !!(window as any).__TAURI__;
@@ -11,6 +12,30 @@ type ListenFn = typeof import("@tauri-apps/api/event").listen;
 let tauriListen: ListenFn | null = null;
 if (isTauri) {
   import("@tauri-apps/api/event").then((m) => { tauriListen = m.listen; }).catch(() => {});
+}
+
+// ── Syntax highlighting with Shiki ────────────────────────────────────────────
+let highlighter: Highlighter | null = null;
+let highlighterPromise: Promise<Highlighter> | null = null;
+
+async function getHighlighter() {
+  if (!highlighterPromise) {
+    highlighterPromise = createHighlighter({
+      themes: ["github-dark"],
+      langs: ["typescript", "javascript", "python", "rust", "bash", "json", "tsx", "jsx", "css", "html", "sql", "markdown"]
+    }).then(hl => { highlighter = hl; return hl; });
+  }
+  return highlighterPromise;
+}
+
+async function highlightCode(code: string, lang: string): Promise<string> {
+  try {
+    const hl = await getHighlighter();
+    return hl.codeToHtml(code, { lang: lang || "text", theme: "github-dark" });
+  } catch {
+    // Fallback to plain text if highlighting fails
+    return `<pre><code>${code.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</code></pre>`;
+  }
 }
 
 type Props = {
@@ -250,8 +275,14 @@ function Avatar({ kind }: { kind: "user" | "assistant" }) {
   );
 }
 
-function CodeBlock({ code }: { code: string }) {
+function CodeBlock({ code, lang }: { code: string; lang?: string }) {
+  const [html, setHtml] = useState("");
   const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    highlightCode(code, lang || "").then(setHtml);
+  }, [code, lang]);
+
   return (
     <div className="relative my-2">
       <button
@@ -260,11 +291,12 @@ function CodeBlock({ code }: { code: string }) {
           if (await copyText(code)) { setCopied(true); setTimeout(() => setCopied(false), 1200); }
         }}
       >
-        {copied ? "Copied" : "Copy"}
+        {copied ? "✓ Copied" : "Copy"}
       </button>
-      <pre className="text-xs whitespace-pre overflow-x-auto rounded-lg bg-black/40 border border-white/10 p-3">
-        <code>{code}</code>
-      </pre>
+      <div 
+        className="text-xs overflow-x-auto rounded-lg bg-black/40 border border-white/10"
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
     </div>
   );
 }
@@ -279,7 +311,9 @@ function Md({ text }: { text: string }) {
           const raw  = String(children ?? "");
           const code = raw.replace(/\n$/, "");
           const isBlock = (className || "").includes("language-") || raw.includes("\n");
-          if (isBlock) return <CodeBlock code={code} />;
+          // Extract language from className (e.g., "language-typescript" → "typescript")
+          const lang = className?.replace("language-", "") || "";
+          if (isBlock) return <CodeBlock code={code} lang={lang} />;
           return <code className="text-xs rounded bg-black/40 border border-white/10 px-1 py-0.5">{children}</code>;
         },
       }}

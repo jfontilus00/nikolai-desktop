@@ -37,6 +37,109 @@ function splitArgs(input: string): string[] {
   return out;
 }
 
+const FS_ALLOWED_KEYS = [
+  "mcp.fs.allowedDirs",
+  "mcp.fs.allowed_dirs",
+  "mcp_fs_allowed_dirs",
+  "mcpFsAllowedDirs",
+];
+
+function loadFsAllowedDirsText(): string {
+  try {
+    for (const k of FS_ALLOWED_KEYS) {
+      const v = localStorage.getItem(k);
+      if (typeof v === "string" && v.length) return v;
+    }
+  } catch {}
+  return "";
+}
+
+function saveFsAllowedDirsText(v: string) {
+  try {
+    for (const k of FS_ALLOWED_KEYS) localStorage.setItem(k, v);
+  } catch {}
+}
+
+function normalizeAllowedDir(input: string): string | null {
+  let p = String(input || "").trim();
+  if (!p) return null;
+  p = p.replace(/^"+|"+$/g, "").replace(/^'+|'+$/g, "");
+  if (p.startsWith("\\\\?\\")) p = p.slice(4);
+  if (p.startsWith("//?/")) p = p.slice(4);
+  p = p.replace(/\\/g, "/");
+  p = p.replace(/\/+/g, "/");
+  if (/^[a-z]:\/$/.test(p)) return p;
+  p = p.replace(/\/+$/, "");
+  return p || null;
+}
+
+function normalizeAllowedList(lines: string[]): string[] {
+  const out: string[] = [];
+  for (const l of lines) {
+    const n = normalizeAllowedDir(l);
+    if (n && !out.includes(n)) out.push(n);
+    if (n && /^[A-Za-z]:\//.test(n)) {
+      const alt = (n[0] === n[0].toLowerCase() ? n[0].toUpperCase() : n[0].toLowerCase()) + n.slice(1);
+      if (!out.includes(alt)) out.push(alt);
+    }
+  }
+  return out;
+}
+
+function applyFsAllowedDirs(command: string, args: string[], allowed: string[]): string[] {
+  if (!command) return args;
+  if (!allowed || allowed.length === 0) return args;
+  const pkgIdx = args.findIndex((a) =>
+    a.includes("@modelcontextprotocol/server-filesystem") || a.includes("server-filesystem")
+  );
+  if (pkgIdx < 0) return args;
+  const head = args.slice(0, pkgIdx + 1);
+  const tail = args.slice(pkgIdx + 1);
+  const kept: string[] = [];
+  for (const t of tail) {
+    if (t.startsWith("-")) {
+      kept.push(t);
+      continue;
+    }
+    break;
+  }
+  return [...head, ...kept, ...allowed];
+}
+
+function findHubConfigPath(args: string[]): { idx: number; path: string; inline: boolean } | null {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("--config=")) {
+      const p = a.slice("--config=".length);
+      if (p) return { idx: i, path: p, inline: true };
+    }
+    if (a === "--config" && i + 1 < args.length) return { idx: i + 1, path: args[i + 1], inline: false };
+  }
+  return null;
+}
+
+async function prepareHubArgs(args: string[], cwd: string | null, allowed: string[]): Promise<string[]> {
+  const cfg = findHubConfigPath(args);
+  if (!cfg) return args;
+  try {
+    const { invoke } = await import("@tauri-apps/api/tauri");
+    const runtimePath = await invoke<string>("mcp_prepare_hub_config", {
+      configPath: cfg.path,
+      cwd,
+      allowedDirs: allowed,
+    });
+    const next = [...args];
+    if (cfg.inline) {
+      next[cfg.idx] = `--config=${runtimePath}`;
+    } else {
+      next[cfg.idx] = runtimePath;
+    }
+    return next;
+  } catch {
+    return args;
+  }
+}
+
 // ── Uptime display ────────────────────────────────────────────────────────────
 function useUptime(connectedAt: number | null): string {
   const [, tick] = useState(0);
@@ -119,6 +222,9 @@ export default function ToolsPanel({ onInsertToComposer }: Props) {
   // MCP profiles
   const [profiles, setProfiles] = useState<McpProfile[]>(() => loadMcpProfiles());
   const [activeId, setActiveId] = useState<string | null>(() => loadActiveMcpProfileId());
+  const [fsAllowedText, setFsAllowedText] = useState<string>(() =>
+    loadFsAllowedDirsText()
+  );
 
   const {
     mcpState, tools, toolsRaw, error, loading, toolsLoading,
@@ -155,17 +261,18 @@ export default function ToolsPanel({ onInsertToComposer }: Props) {
 
     didAutoConnect.current = true;
 
-    const args = splitArgs(activeProfile.args || "");
-    const cfg = { command: activeProfile.command, args, cwd: activeProfile.cwd || null };
+    (async () => {
+      const cfg = await buildMcpCfg(activeProfile);
 
-    // Register reconnect callback for unexpected drops
-    setAutoReconnectCallback(() => {
-      console.log("[ToolsPanel] auto-reconnect triggered");
-      connect(cfg).catch(() => {/* handled by store error */});
-    });
+      // Register reconnect callback for unexpected drops
+      setAutoReconnectCallback(() => {
+        console.log("[ToolsPanel] auto-reconnect triggered");
+        connect(cfg).catch(() => {/* handled by store error */});
+      });
 
-    console.log("[ToolsPanel] auto-connecting on startup...");
-    connect(cfg).catch(() => {});
+      console.log("[ToolsPanel] auto-connecting on startup...");
+      connect(cfg).catch(() => {});
+    })();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProfile, mcpState]);
 
@@ -181,6 +288,14 @@ export default function ToolsPanel({ onInsertToComposer }: Props) {
     const next = profiles.map((p) => (p.id === activeProfile.id ? { ...p, ...patch } : p));
     setProfiles(next);
     saveMcpProfiles(next);
+  }
+
+  async function buildMcpCfg(profile: McpProfile) {
+    const baseArgs = splitArgs(profile.args || "");
+    const allowed = normalizeAllowedList(String(fsAllowedText || "").split(/\r?\n/));
+    const argsApplied = applyFsAllowedDirs(profile.command || "", baseArgs, allowed);
+    const args = await prepareHubArgs(argsApplied, profile.cwd || null, allowed);
+    return { command: profile.command, args, cwd: profile.cwd || null };
   }
   function createProfile() {
     const name = prompt("New MCP profile name", "New MCP");
@@ -211,10 +326,23 @@ export default function ToolsPanel({ onInsertToComposer }: Props) {
 
   async function handleConnect() {
     if (!activeProfile) return;
-    const args = splitArgs(activeProfile.args || "");
-    const cfg = { command: activeProfile.command, args, cwd: activeProfile.cwd || null };
+    const cfg = await buildMcpCfg(activeProfile);
 
     // Register reconnect callback
+    setAutoReconnectCallback(() => connect(cfg).catch(() => {}));
+    await connect(cfg);
+  }
+
+  function handleSaveFsAllowed() {
+    const normalized = normalizeAllowedList(String(fsAllowedText || "").split(/\r?\n/));
+    setFsAllowedText(normalized.join("\n"));
+    saveFsAllowedDirsText(normalized.join("\n"));
+  }
+
+  async function handleRestartFsServer() {
+    if (!activeProfile) return;
+    const cfg = await buildMcpCfg(activeProfile);
+    try { await disconnect(); } catch {}
     setAutoReconnectCallback(() => connect(cfg).catch(() => {}));
     await connect(cfg);
   }
@@ -390,6 +518,29 @@ export default function ToolsPanel({ onInsertToComposer }: Props) {
                     onChange={(e) => updateProfile({ cwd: e.target.value })}
                     placeholder="C:\Users\you\project"
                   />
+
+                  <label className="text-[11px] text-white/40">Filesystem allowed directories (one per line)</label>
+                  <textarea
+                    className="w-full min-h-[96px] px-2 py-1.5 rounded bg-black/30 border border-white/10 text-xs text-white/80 placeholder-white/20"
+                    value={fsAllowedText}
+                    onChange={(e) => setFsAllowedText(e.target.value)}
+                    placeholder="C:\Dev"
+                  />
+                  <div className="flex gap-2">
+                    <button
+                      className="flex-1 px-3 py-1.5 rounded bg-white/10 hover:bg-white/15 border border-white/10 text-xs text-white/70 transition-colors"
+                      onClick={handleSaveFsAllowed}
+                    >
+                      Save
+                    </button>
+                    <button
+                      className="flex-1 px-3 py-1.5 rounded bg-white/10 hover:bg-white/15 border border-white/10 text-xs text-white/70 transition-colors"
+                      onClick={handleRestartFsServer}
+                      disabled={!activeProfile?.command || loading}
+                    >
+                      Restart filesystem server
+                    </button>
+                  </div>
 
                   <label className="flex items-center gap-2 text-xs text-white/60 pt-0.5 cursor-pointer select-none">
                     <input

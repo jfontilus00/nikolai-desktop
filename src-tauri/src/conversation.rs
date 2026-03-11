@@ -1,8 +1,6 @@
 use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::State;
+use crate::db::DbState;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Conversation {
@@ -20,85 +18,112 @@ pub struct Message {
   pub created_at: i64,
 }
 
-#[derive(Default)]
-struct Store {
-  conversations: Vec<Conversation>,
-  messages: HashMap<String, Vec<Message>>,
-}
-
-static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-fn store() -> &'static Mutex<Store> {
-  STORE.get_or_init(|| Mutex::new(Store::default()))
-}
-
-fn now_ts() -> i64 {
-  SystemTime::now()
-    .duration_since(UNIX_EPOCH)
-    .unwrap_or_default()
-    .as_secs() as i64
-}
-
 fn new_id(prefix: &str) -> String {
+  use std::sync::atomic::{AtomicU64, Ordering};
+  static NEXT_ID: AtomicU64 = AtomicU64::new(1);
   let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
   format!("{prefix}_{n}")
 }
 
 #[tauri::command]
-pub fn conversation_create(title: Option<String>) -> Result<Conversation, String> {
-  let mut s = store().lock().map_err(|_| "store lock poisoned".to_string())?;
-  let conv = Conversation {
-    id: new_id("c"),
-    title: title.unwrap_or_else(|| "New conversation".to_string()),
-    created_at: now_ts(),
-  };
-  s.conversations.push(conv.clone());
-  Ok(conv)
+pub fn conversation_create(
+  db_state: State<'_, DbState>,
+  title: Option<String>,
+) -> Result<Conversation, String> {
+  let id = new_id("c");
+  let title = title.unwrap_or_else(|| "New conversation".to_string());
+  let model = "default".to_string();
+  let now = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_err(|e| format!("Time error: {}", e))?
+    .as_millis() as i64;
+
+  db_state.with_connection(|conn| {
+    crate::db::create_conversation(conn, &id, &title, &model)?;
+    Ok(())
+  })?;
+
+  Ok(Conversation {
+    id,
+    title,
+    created_at: now,
+  })
 }
 
 #[tauri::command]
-pub fn conversation_list() -> Result<Vec<Conversation>, String> {
-  let s = store().lock().map_err(|_| "store lock poisoned".to_string())?;
-  Ok(s.conversations.clone())
+pub fn conversation_list(
+  db_state: State<'_, DbState>,
+) -> Result<Vec<Conversation>, String> {
+  db_state.with_connection(|conn| {
+    let rows = crate::db::list_conversations(conn)?;
+    let conversations = rows
+      .into_iter()
+      .map(|(id, title, _model, created_at, _updated_at)| Conversation {
+        id,
+        title,
+        created_at,
+      })
+      .collect();
+    Ok(conversations)
+  })
 }
 
 #[tauri::command]
-pub fn conversation_delete(conversation_id: String) -> Result<bool, String> {
-  let mut s = store().lock().map_err(|_| "store lock poisoned".to_string())?;
-  let before = s.conversations.len();
-  s.conversations.retain(|c| c.id != conversation_id);
-  s.messages.remove(&conversation_id);
-  Ok(s.conversations.len() != before)
+pub fn conversation_delete(
+  db_state: State<'_, DbState>,
+  conversation_id: String,
+) -> Result<bool, String> {
+  db_state.with_connection(|conn| {
+    crate::db::delete_conversation(conn, &conversation_id)?;
+    Ok(true)
+  })
 }
 
 #[tauri::command]
 pub fn message_send(
+  db_state: State<'_, DbState>,
   conversation_id: String,
   role: String,
   content: String,
 ) -> Result<Message, String> {
-  let mut s = store().lock().map_err(|_| "store lock poisoned".to_string())?;
+  let id = new_id("m");
+  let now = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_err(|e| format!("Time error: {}", e))?
+    .as_millis() as i64;
 
-  let exists = s.conversations.iter().any(|c| c.id == conversation_id);
-  if !exists {
-    return Err("conversation not found".to_string());
-  }
+  db_state.with_connection(|conn| {
+    crate::db::save_message(conn, &id, &conversation_id, &role, &content)?;
+    crate::db::compress_messages_if_needed(conn, &conversation_id)?;
+    Ok(())
+  })?;
 
-  let msg = Message {
-    id: new_id("m"),
-    conversation_id: conversation_id.clone(),
+  Ok(Message {
+    id,
+    conversation_id,
     role,
     content,
-    created_at: now_ts(),
-  };
-
-  s.messages.entry(conversation_id).or_default().push(msg.clone());
-  Ok(msg)
+    created_at: now,
+  })
 }
 
 #[tauri::command]
-pub fn message_list(conversation_id: String) -> Result<Vec<Message>, String> {
-  let s = store().lock().map_err(|_| "store lock poisoned".to_string())?;
-  Ok(s.messages.get(&conversation_id).cloned().unwrap_or_default())
+pub fn message_list(
+  db_state: State<'_, DbState>,
+  conversation_id: String,
+) -> Result<Vec<Message>, String> {
+  db_state.with_connection(|conn| {
+    let rows = crate::db::load_messages(conn, &conversation_id)?;
+    let messages = rows
+      .into_iter()
+      .map(|(role, content)| Message {
+        id: String::new(),
+        conversation_id: conversation_id.clone(),
+        role,
+        content,
+        created_at: 0,
+      })
+      .collect();
+    Ok(messages)
+  })
 }

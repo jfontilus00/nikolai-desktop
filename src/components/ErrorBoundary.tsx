@@ -1,11 +1,38 @@
 import React from "react";
 import { copyText } from "../lib/clipboard";
+import { writeTextFile, BaseDirectory } from "@tauri-apps/api/fs";
 
 type State = {
   hasError: boolean;
   message: string;
   stack?: string;
 };
+
+// ── Crash Log Helper ──────────────────────────────────────────────────────────
+// Writes crash information to disk for later analysis.
+// Never throws — errors are silently logged to console.
+
+async function writeCrashLog(message: string, stack?: string) {
+  const timestamp = new Date().toISOString();
+  const entry =
+    `[${timestamp}] CRASH\n` +
+    `Message: ${message}\n` +
+    `Stack:\n${stack ?? "none"}\n\n`;
+
+  try {
+    await writeTextFile(
+      "nikolai-crash.log",
+      entry,
+      {
+        dir: BaseDirectory.AppLog,
+        append: true
+      }
+    );
+  } catch (err) {
+    // Crash handler must never throw — log to console and continue
+    console.warn("[nikolai] failed to write crash log", err);
+  }
+}
 
 export default class ErrorBoundary extends React.Component<{ children: React.ReactNode }, State> {
   state: State = { hasError: false, message: "" };
@@ -17,6 +44,10 @@ export default class ErrorBoundary extends React.Component<{ children: React.Rea
   componentDidCatch(err: any) {
     // keep console useful
     console.error("[ErrorBoundary]", err);
+
+    // Write crash log to disk for later analysis
+    const componentStack = err?.stack ?? err?.componentStack ?? "none";
+    writeCrashLog(err?.message || String(err), componentStack);
   }
 
   private resetApp = () => {

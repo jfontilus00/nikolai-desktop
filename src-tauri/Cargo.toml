@@ -31,5 +31,8 @@ futures-util = "0.3"
 # FIXED: removed invalid feature "sync"
 tokio-util = "0.7"
 
+# SQLite database (direct rusqlite for Tauri v1)
+rusqlite = { version = "0.29", features = ["bundled"] }
+
 [features]
 custom-protocol = ["tauri/custom-protocol"]

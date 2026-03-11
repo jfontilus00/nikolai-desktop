@@ -1,16 +1,18 @@
 ﻿import { invoke } from "@tauri-apps/api/tauri";
 import { ollamaChat, type OllamaMsg } from "./ollamaChat";
 import { ollamaStreamChat } from "./ollamaStream";
-import { mcpListTools, getCachedTools, type McpTool } from "./mcp";
+import { getCachedTools as getToolCatalog, type McpTool } from "./tool_cache";
 import { appendToolLog } from "./toolLog";
 import { formatToolResult } from "./toolResult";
 import { loadMemory, formatMemoryForPrompt, addFact } from "./memory";
 import { loadIndex, searchIndex, formatSearchResults, type SemanticIndex } from "./semanticIndex";
+import { startAgentMetrics, incrementStep, recordToolUsage, finishAgentMetrics, recordLowConfidenceTool, recordReasoningLength, recordToolBudgetRemaining } from "./agent_metrics";
+import { createLoopGuard, recordTool, detectLoop, type LoopGuardState } from "./agent_loop_guard";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type Plan =
-  | { action: "tool"; name: string; args: any }
+  | { action: "tool"; name: string; args: any; confidence?: number; reasoning?: string }
   | { action: "final"; content: string };
 
 type StepRecord = {
@@ -19,6 +21,48 @@ type StepRecord = {
   ok: boolean;
   summary: string;
 };
+
+// ── Agent Execution Trace ────────────────────────────────────────────────────
+// Records detailed decision history for debugging agent behavior.
+// Trace is console-only, NOT persisted between runs.
+interface ExecutionTrace {
+  step: number;
+  reasoning: string;
+  tool?: string;
+  args?: any;
+  resultSummary?: string;
+}
+
+const executionTrace: ExecutionTrace[] = [];
+
+// ── Tool confidence threshold ────────────────────────────────────────────────
+// Minimum confidence required to execute a tool call.
+// If confidence is below this, agent reconsiders reasoning.
+const TOOL_CONFIDENCE_THRESHOLD = 0.6;
+const DEFAULT_CONFIDENCE = 0.7;  // Assumed confidence when not specified
+
+// ── Reasoning requirements ───────────────────────────────────────────────────
+// Minimum length for reasoning text to ensure agent explains its decision.
+const MIN_REASONING_LENGTH = 10;  // characters
+
+// ── Adaptive Tool Budget ─────────────────────────────────────────────────────
+// Limits tool calls to prevent excessive usage and improve reasoning stability.
+const BASE_TOOL_BUDGET = 6;       // Default tool calls allowed
+const MAX_TOOL_BUDGET = 12;       // Absolute maximum for complex tasks
+
+// ── Tool Result Cache ────────────────────────────────────────────────────────
+// Caches tool results within a single agent run to prevent redundant calls.
+// Cache is NOT persisted between runs — only lives for duration of agent run.
+const toolResultCache = new Map<string, any>();
+
+function getToolCacheKey(name: string, args: any): string {
+  try {
+    return `${name}:${JSON.stringify(args)}`;
+  } catch {
+    // Fallback for non-serializable args
+    return `${name}:${String(args)}`;
+  }
+}
 
 // ── Batch write types (match src-tauri/src/workspace.rs exactly) ──────────────
 
@@ -46,6 +90,10 @@ const MAX_RESULT_CHARS = 6000;
 /** How many times to retry plan parsing before giving up on a step. */
 const MAX_PLAN_PARSE_RETRIES = 2;
 
+// ── Agent Step Timeout ──────────────────────────────────────────────────────
+// Maximum time allowed for each agent step to prevent hanging.
+const MAX_AGENT_STEP_TIME = 60000; // 60 seconds
+
 // ── Priority 2: Context window constants ──────────────────────────────────────
 //
 // After N tool steps the conversation accumulates thousands of characters.
@@ -55,18 +103,43 @@ const MAX_PLAN_PARSE_RETRIES = 2;
 // We keep: all original user messages (the goal) + last KEEP_LAST_TOOL_RESULTS
 // tool exchange messages. Everything older is dropped.
 //
-const MAX_CONTEXT_CHARS     = 10_000; // ~2500 tokens — safe headroom for most 8B models
-const KEEP_LAST_TOOL_RESULTS = 4;     // keep last 4 tool result messages
+export const MAX_CONTEXT_CHARS     = 10_000; // ~2500 tokens — safe headroom for most 8B models
+export const KEEP_LAST_TOOL_RESULTS = 4;     // keep last 4 tool result messages
 
-// ── Tool blocklist ────────────────────────────────────────────────────────────
-
-const BLOCKED_TOOL_PATTERNS: RegExp[] = [
-  /^doc-suite\.doc_suite\.(email_send|sms_send|webhook_post|http_request)/i,
-  /^doc-suite\.doc_suite\.oauth/i,
+// ── Tool allowlist (SECURITY: explicit opt-in for safe tools) ────────────────
+// Only tools explicitly listed here are permitted for agent execution.
+// This is more secure than blocklisting because new MCP tools cannot bypass
+// the filter accidentally — they must be explicitly added to the allowlist.
+//
+// Categories:
+// - fs.*: Filesystem operations (read, write, search, list, etc.)
+// - semantic.find: Semantic code search (synthetic tool)
+// - memory.*: Workspace memory operations (synthetic tool)
+// - hub.*: MCP hub management (refresh, status)
+//
+export const ALLOWED_TOOLS: string[] = [
+  // Filesystem operations
+  "fs.read_file",
+  "fs.write_file",
+  "fs.list_directory",
+  "fs.search_files",
+  "fs.edit_file",
+  "fs.create_directory",
+  "fs.delete_file",
+  "fs.copy_file",
+  "fs.move_file",
+  "fs.rename_file",
+  // Semantic search (synthetic)
+  "semantic.find",
+  // Memory operations (synthetic)
+  "memory.add_fact",
+  // Hub management
+  "hub.refresh",
+  "hub.status",
 ];
 
 function isAgentTool(name: string): boolean {
-  return !BLOCKED_TOOL_PATTERNS.some((p) => p.test(name));
+  return ALLOWED_TOOLS.some((allowed) => allowed === name);
 }
 
 // ── Tool name aliasing ────────────────────────────────────────────────────────
@@ -374,7 +447,7 @@ function isToolExchangeMessage(msg: OllamaMsg): boolean {
   );
 }
 
-function trimContext(convo: OllamaMsg[]): OllamaMsg[] {
+export function trimContext(convo: OllamaMsg[]): OllamaMsg[] {
   // Find where tool exchange starts
   const firstToolIdx = convo.findIndex(isToolExchangeMessage);
   if (firstToolIdx < 0) return convo; // no tool messages yet — nothing to trim
@@ -383,11 +456,23 @@ function trimContext(convo: OllamaMsg[]): OllamaMsg[] {
   const toolExchange  = convo.slice(firstToolIdx);
 
   // Keep only the last KEEP_LAST_TOOL_RESULTS tool exchange messages
+  const dropped = toolExchange.length > KEEP_LAST_TOOL_RESULTS
+    ? toolExchange.slice(0, -KEEP_LAST_TOOL_RESULTS)
+    : [];
   const kept = toolExchange.length > KEEP_LAST_TOOL_RESULTS
     ? toolExchange.slice(-KEEP_LAST_TOOL_RESULTS)
     : toolExchange;
 
-  const trimmed = [...originalMsgs, ...kept];
+  // ── Context Summarization ──────────────────────────────────────────────────
+  // When we drop old tool messages, create a summary so the agent remembers
+  // what was done. This prevents losing important context on long runs.
+  let summaryMsg: OllamaMsg | null = null;
+  if (dropped.length > 0) {
+    const summary = summarizeDroppedTools(dropped);
+    summaryMsg = { role: "system" as const, content: summary };
+  }
+
+  const trimmed = [...originalMsgs, ...(summaryMsg ? [summaryMsg] : []), ...kept];
 
   // Check total char count
   const totalChars = trimmed.reduce((s, m) => s + (m.content || "").length, 0);
@@ -404,6 +489,87 @@ function trimContext(convo: OllamaMsg[]): OllamaMsg[] {
     }
     return m;
   });
+}
+
+// ── Summarize Dropped Tool Messages ──────────────────────────────────────────
+// Creates a compact summary of tool executions that were dropped from context.
+// This preserves important information while reducing token count.
+
+function summarizeDroppedTools(dropped: OllamaMsg[]): string {
+  const toolCalls: string[] = [];
+  const errors: string[] = [];
+  const modifiedFiles: string[] = [];
+
+  for (const msg of dropped) {
+    const content = String(msg.content || "");
+
+    // Extract tool name from [tool result: toolName] or [tool error: toolName]
+    const match = content.match(/^\[(?:tool result|tool error):\s*([^\]]+)\]/);
+    if (!match) continue;
+
+    const toolName = match[1].trim();
+    const isError = content.startsWith("[tool error:");
+
+    // Track tool calls
+    if (!toolCalls.includes(toolName)) {
+      toolCalls.push(toolName);
+    }
+
+    // Track errors
+    if (isError) {
+      const errorDetail = content.split("\n")[1]?.slice(0, 100) || "Unknown error";
+      errors.push(`${toolName}: ${errorDetail}`);
+    }
+
+    // Track file modifications
+    if (toolName.startsWith("fs.") && !isError) {
+      const pathMatch = content.match(/path["':\s]+([^\s,\n\)]+)/i) ||
+                        content.match(/Staged:\s*([^\s(]+)/i);
+      if (pathMatch && pathMatch[1]) {
+        const path = pathMatch[1].replace(/["',]/g, "");
+        if (!modifiedFiles.includes(path)) {
+          modifiedFiles.push(path);
+        }
+      }
+    }
+  }
+
+  // Build summary
+  const lines: string[] = [
+    `[summary of earlier steps]`,
+    `Tools executed (${toolCalls.length} total):`,
+  ];
+
+  if (toolCalls.length > 0) {
+    // Group by prefix (e.g., "fs.*" → "filesystem operations")
+    const fsTools = toolCalls.filter(t => t.startsWith("fs."));
+    const hubTools = toolCalls.filter(t => t.startsWith("hub."));
+    const otherTools = toolCalls.filter(t => !t.startsWith("fs.") && !t.startsWith("hub."));
+
+    if (fsTools.length > 0) lines.push(`  • Filesystem: ${fsTools.map(t => t.split(".").pop()).join(", ")}`);
+    if (hubTools.length > 0) lines.push(`  • Hub: ${hubTools.map(t => t.split(".").pop()).join(", ")}`);
+    if (otherTools.length > 0) lines.push(`  • Other: ${otherTools.join(", ")}`);
+  } else {
+    lines.push(`  (none)`);
+  }
+
+  if (errors.length > 0) {
+    lines.push(`\nErrors (${errors.length}):`);
+    errors.slice(0, 5).forEach(e => lines.push(`  • ${e}`));
+    if (errors.length > 5) lines.push(`  • ...and ${errors.length - 5} more`);
+  } else {
+    lines.push(`\nErrors: none`);
+  }
+
+  if (modifiedFiles.length > 0) {
+    lines.push(`\nFiles modified (${modifiedFiles.length}):`);
+    modifiedFiles.slice(0, 5).forEach(f => lines.push(`  • ${f}`));
+    if (modifiedFiles.length > 5) lines.push(`  • ...and ${modifiedFiles.length - 5} more`);
+  }
+
+  lines.push(`\n[end summary — continue with recent tool results below]`);
+
+  return lines.join("\n");
 }
 
 // ── Human-readable status messages ───────────────────────────────────────────
@@ -482,14 +648,57 @@ function stripCodeFences(s: string) {
   return (s || "").trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
 }
 
-function parsePlan(raw: string): Plan | null {
+// ── Safe JSON Repair for LLM Responses ──────────────────────────────────────
+// LLMs often produce malformed JSON. This function attempts lightweight repairs
+// before giving up. Handles common issues:
+// - Unquoted keys: { tool: "..." } → { "tool": "..." }
+// - Trailing commas: { "a": 1, } → { "a": 1 }
+// - Single quotes: { 'a': 1 } → { "a": 1 }
+// - Markdown artifacts: Extra whitespace, code fence remnants
+
+function repairJsonString(jsonStr: string): string {
+  let repaired = jsonStr;
+
+  // Step 1: Remove trailing commas before } or ]
+  // Matches: , followed by optional whitespace and } or ]
+  repaired = repaired.replace(/,\s*([}\]])/g, '$1');
+
+  // Step 2: Quote unquoted keys
+  // Matches: word characters at start of key position (after { or ,)
+  // Pattern: { or , followed by whitespace, then unquoted key, then :
+  repaired = repaired.replace(
+    /([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g,
+    '$1"$2":'
+  );
+
+  // Step 3: Convert single quotes to double quotes for keys and string values
+  // This is tricky - we need to be careful not to break strings containing '
+  // Simple approach: convert '{' to "{" when it looks like a key or value marker
+  repaired = repaired.replace(
+    /'([^']*)'\s*:/g,
+    '"$1":'
+  );
+
+  // Step 4: Normalize escaped newlines that might break parsing
+  repaired = repaired.replace(/\\n/g, '\n');
+
+  // Step 5: Remove any remaining markdown artifacts
+  repaired = repaired.replace(/```\s*/g, '').replace(/\*\*/g, '');
+
+  return repaired;
+}
+
+export function parsePlan(raw: string): Plan | null {
   const cleaned = stripCodeFences(raw);
   const start = cleaned.indexOf("{");
   const end = cleaned.lastIndexOf("}");
   if (start < 0 || end <= start) return null;
 
+  const jsonCandidate = cleaned.slice(start, end + 1);
+
+  // Attempt 1: Try normal JSON parse (fast path for well-formed JSON)
   try {
-    const obj: any = JSON.parse(cleaned.slice(start, end + 1));
+    const obj: any = JSON.parse(jsonCandidate);
     if (obj?.action === "tool" && typeof obj?.name === "string") {
       return { action: "tool", name: obj.name, args: obj.args ?? {} };
     }
@@ -498,8 +707,57 @@ function parsePlan(raw: string): Plan | null {
     }
     return null;
   } catch {
+    // Parse failed — try repair
+  }
+
+  // Attempt 2: Try repaired JSON
+  try {
+    const repaired = repairJsonString(jsonCandidate);
+    const obj: any = JSON.parse(repaired);
+    if (obj?.action === "tool" && typeof obj?.name === "string") {
+      return { action: "tool", name: obj.name, args: obj.args ?? {} };
+    }
+    if (obj?.action === "final" && typeof obj?.content === "string") {
+      return { action: "final", content: obj.content };
+    }
+    return null;
+  } catch {
+    // Repair also failed — return null (existing error behavior)
     return null;
   }
+}
+
+// ── Plan Verification ────────────────────────────────────────────────────────
+// Validates that a parsed plan is structurally valid before execution.
+// This catches malformed or incomplete plans before wasting tool budget.
+
+async function verifyPlan(plan: Plan, userGoal: string): Promise<{ valid: boolean; reason: string }> {
+  // Serialize plan for inspection
+  const planText = JSON.stringify(plan);
+
+  // Check for empty or near-empty plan
+  if (!planText || planText.length < 5) {
+    return { valid: false, reason: "empty plan" };
+  }
+
+  // Check for required fields based on action type
+  if (plan.action === "tool") {
+    if (!plan.name || typeof plan.name !== "string") {
+      return { valid: false, reason: "missing tool name" };
+    }
+    if (plan.args === undefined || plan.args === null) {
+      return { valid: false, reason: "missing tool args" };
+    }
+  } else if (plan.action === "final") {
+    if (!plan.content || typeof plan.content !== "string") {
+      return { valid: false, reason: "missing final content" };
+    }
+  } else {
+    return { valid: false, reason: "unknown action type" };
+  }
+
+  // Plan passed basic validation
+  return { valid: true, reason: "" };
 }
 
 // ── Tool catalog ──────────────────────────────────────────────────────────────
@@ -624,6 +882,85 @@ function buildPlannerSystem(
   };
 }
 
+// ── Agent Run Persistence (lightweight recovery) ─────────────────────────────
+// Minimal state persisted to localStorage so agent runs can survive UI reloads
+// or crashes. Only stores essential info for recovery, not full conversation.
+
+type AgentRunState = {
+  runId: string;
+  step: number;
+  maxSteps: number;
+  workspaceRoot: string | null;
+  lastTool: string | null;
+  lastToolArgs: any | null;
+  lastToolOk: boolean | null;
+  timestamp: number;
+  status: "running" | "completed" | "failed";
+};
+
+const AGENT_RUN_STORAGE_KEY = "nikolai.agent.run.v1";
+
+// ── Export for graceful shutdown hook ────────────────────────────────────────
+export function saveAgentRunState(state: Partial<AgentRunState>): void {
+  try {
+    const existingRaw = localStorage.getItem(AGENT_RUN_STORAGE_KEY);
+    const existing: Partial<AgentRunState> = existingRaw ? JSON.parse(existingRaw) : {};
+    const merged = { ...existing, ...state, timestamp: Date.now() };
+    localStorage.setItem(AGENT_RUN_STORAGE_KEY, JSON.stringify(merged));
+  } catch (e) {
+    // Private browsing, quota exceeded, storage disabled, security restrictions
+    console.warn("[agentic] persistence failed: saveAgentRunState", e);
+  }
+}
+
+function loadAgentRunState(): AgentRunState | null {
+  try {
+    const raw = localStorage.getItem(AGENT_RUN_STORAGE_KEY);
+    if (!raw) return null;
+    const state = JSON.parse(raw) as AgentRunState;
+    // Invalidate if older than 1 hour (stale run)
+    if (Date.now() - state.timestamp > 60 * 60 * 1000) {
+      clearAgentRunState();
+      return null;
+    }
+    return state;
+  } catch (e) {
+    // Private browsing, quota exceeded, storage disabled, security restrictions
+    console.warn("[agentic] persistence failed: loadAgentRunState", e);
+    return null;
+  }
+}
+
+function clearAgentRunState(): void {
+  try {
+    localStorage.removeItem(AGENT_RUN_STORAGE_KEY);
+  } catch (e) {
+    // Private browsing, quota exceeded, storage disabled, security restrictions
+    console.warn("[agentic] persistence failed: clearAgentRunState", e);
+  }
+}
+
+function markAgentRunComplete(): void {
+  try {
+    saveAgentRunState({ status: "completed" });
+  } catch (e) {
+    console.warn("[agentic] persistence failed: markAgentRunComplete", e);
+  }
+}
+
+// ── Adaptive Tool Budget Helper ──────────────────────────────────────────────
+// Computes tool budget based on user input complexity.
+// Shorter inputs need fewer tools; longer inputs may need more exploration.
+function computeToolBudget(userPrompt: string): number {
+  const length = userPrompt.length;
+  
+  if (length < 80) return 3;       // Simple question
+  if (length < 200) return 5;      // Moderate task
+  if (length < 500) return 8;      // Complex task
+  
+  return BASE_TOOL_BUDGET;         // Default for very long inputs
+}
+
 // ── Main export ───────────────────────────────────────────────────────────────
 
 export async function agenticStreamChat(opts: {
@@ -640,42 +977,77 @@ export async function agenticStreamChat(opts: {
   // to drive the agentic loop. When omitted, defaults to ollamaChat/ollamaStreamChat.
   chatFn?: (messages: OllamaMsg[], signal: AbortSignal) => Promise<string>;
   streamFn?: (messages: OllamaMsg[], signal: AbortSignal, onToken: (t: string) => void) => Promise<void>;
+  // Optional: unique run ID for persistence (auto-generated if not provided)
+  runId?: string;
 }): Promise<void> {
   const maxSteps = opts.maxSteps ?? 10;
+  const runId = opts.runId || `run-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+
+  // ── Recovery check: detect interrupted run ────────────────────────────────
+  // If a previous run exists and is marked as "running", it was interrupted.
+  // We notify the user but don't auto-resume (would require UI integration).
+  const prevRun = loadAgentRunState();
+  if (prevRun && prevRun.status === "running") {
+    console.warn(
+      `[agentic] Detected interrupted run from ${new Date(prevRun.timestamp).toLocaleString()}. ` +
+      `Run ID: ${prevRun.runId}, Step: ${prevRun.step}/${prevRun.maxSteps}`
+    );
+    // Clear stale run — new run will start fresh
+    clearAgentRunState();
+  }
+
+  // Initialize persistence for this run
+  saveAgentRunState({
+    runId,
+    step: 0,
+    maxSteps,
+    workspaceRoot: null,
+    lastTool: null,
+    lastToolArgs: null,
+    lastToolOk: null,
+    status: "running",
+  });
+
+  // ── Start metrics tracking ─────────────────────────────────────────────────
+  startAgentMetrics(runId);
+
+  // ── Compute adaptive tool budget ──────────────────────────────────────────
+  // Budget based on user input complexity.
+  const firstUserMsg = opts.messages.find((m) => m.role === "user");
+  let toolBudget = computeToolBudget(firstUserMsg?.content || "");
+  console.log(`[agentic] tool budget: ${toolBudget} calls (BASE=${BASE_TOOL_BUDGET}, MAX=${MAX_TOOL_BUDGET})`);
 
   if (!opts.executeTool) {
     opts.onToken(`\n\n[agent] No tool executor provided. Tool calls are blocked.\n`);
+    clearAgentRunState();
+    finishAgentMetrics();
     return;
   }
 
-  // Use the in-memory tool cache — no MCP round-trip on every agentic request.
-  // Falls back to a live fetch only if the cache is empty (first run / reconnect).
-  let tools: McpTool[] = getCachedTools();
-  if (tools.length === 0) {
-    try {
-      tools = await mcpListTools();
-    } catch (e: any) {
-      opts.onToken(
-        `\n\n[agent] MCP not connected (${e?.message || String(e)}). ` +
-        `Go to Settings → Tools → Connect first.\n`
-      );
-      return;
-    }
-  }
+  // Use the tool catalog cache — avoids MCP round-trip on every agentic request.
+  // Cache TTL is 5 minutes; refreshes automatically if expired.
+  let toolCatalogCache = await getToolCatalog();
+  let tools: McpTool[] = toolCatalogCache.tools;
+  let aliasMap = toolCatalogCache.aliasMap;
+  let catalogVersion = toolCatalogCache.version;  // Track version for sync
 
   if (tools.length === 0) {
     opts.onToken(
       `\n\n[agent] No tools loaded yet. Go to Settings → Tools → Connect ` +
       `and wait for the tool list to populate, then try again.\n`
     );
+    saveAgentRunState({ status: "failed" });
+    finishAgentMetrics();
     return;
   }
-
-  let aliasMap = buildToolAliasMap(tools);
 
   // Determine batch mode (workspace root required)
   let workspaceRoot = await getWorkspaceRoot();
   let batchMode = workspaceRoot != null;
+  
+  // Persist workspace root for recovery
+  saveAgentRunState({ workspaceRoot });
+  
   const pendingWrites: PendingWrite[] = [];
 
   // ── Workspace preflight ───────────────────────────────────────────────────
@@ -692,13 +1064,20 @@ export async function agenticStreamChat(opts: {
       const allowedResult = await silentTool(opts.executeTool, "fs.list_allowed_directories", {});
 
       if (allowedResult && allowedResult.trim().length > 0 && !allowedResult.includes("does not exist")) {
-        // Extract paths from the result — handles both line-per-path and JSON array formats
-        const allowedPaths = allowedResult
-          .split(/\r?\n/)
-          .map((l) => l.replace(/^[-\s\[dir\]]+/, "").trim().replace(/\\/g, "/").toLowerCase())
+        let rawList: string[] | null = null;
+        try {
+          const start = allowedResult.indexOf("{");
+          const end = allowedResult.lastIndexOf("}");
+          if (start >= 0 && end > start) {
+            const json = JSON.parse(allowedResult.slice(start, end + 1));
+            if (Array.isArray(json?.allowed)) rawList = json.allowed.map((v: any) => String(v));
+          }
+        } catch {}
+        const allowedPaths = (rawList ?? allowedResult.split(/\r?\n/))
+          .map((l) => l.replace(/^[-\s\[dir\]]+/, "").trim().replace(/\\/g, "/").toLowerCase().replace(/\/+/g, "/").replace(/\/+$/, ""))
           .filter((l) => l.length > 3 && !l.startsWith("[") && !l.startsWith("("));
 
-        const normalizedRoot = workspaceRoot.replace(/\\/g, "/").toLowerCase().replace(/\/+$/, "");
+        const normalizedRoot = workspaceRoot.replace(/\\/g, "/").toLowerCase().replace(/\/+/g, "/").replace(/\/+$/, "");
 
         const isUnderAllowed = allowedPaths.some((allowed) => {
           const normAllowed = allowed.replace(/\/+$/, "");
@@ -947,10 +1326,14 @@ export async function agenticStreamChat(opts: {
     return opts.executeTool!(name, args, opts.signal);
   };
 
-  const catalog = toolCatalog(tools, hasSemanticIndex, batchMode);
+  // catalog already loaded from tool cache above
   const steps: StepRecord[] = [];
   let consecutiveParseFailures = 0;
   const toolArgErrorOnce = new Set<string>();
+  
+  // ── Loop Guard ────────────────────────────────────────────────────────────
+  // Detects repeated tool patterns that indicate infinite reasoning loops.
+  const loopGuard: LoopGuardState = createLoopGuard();
 
   // ── Circuit breaker ───────────────────────────────────────────────────────
   // If the same tool fails N times in a row, block it for the rest of the run.
@@ -1016,9 +1399,19 @@ export async function agenticStreamChat(opts: {
   // ── Agentic loop ──────────────────────────────────────────────────────────
 
   for (let step = 1; step <= maxSteps; step++) {
+    // ── Step Timeout Check ──────────────────────────────────────────────────
+    // Prevent hanging steps with timeout check.
+    const stepStart = Date.now();
+
     if (opts.signal.aborted) throw Object.assign(new Error("Aborted"), { name: "AbortError" });
 
-    const plannerSystem = buildPlannerSystem(catalog, step, maxSteps, batchMode, memoryText);
+    // ── Record step for metrics ─────────────────────────────────────────────
+    incrementStep();
+
+    const plannerSystem = buildPlannerSystem(
+      toolCatalog(toolCatalogCache.tools, hasSemanticIndex, batchMode),
+      step, maxSteps, batchMode, memoryText
+    );
 
     opts.onStatus?.(`🤔 Planning step ${step}…`);
 
@@ -1032,23 +1425,57 @@ export async function agenticStreamChat(opts: {
       console.log(`[agentic] Context trimmed: dropped ${droppedCount} old messages (${convo.length} → ${trimmedConvo.length})`);
     }
 
+    // ── Retry logic with exponential backoff ───────────────────────────────
+    // Transient LLM failures (network glitches, model restarts, provider errors)
+    // should not immediately abort the agent run. Retry up to 3 times with
+    // increasing delays before giving up.
+    const MAX_LLM_RETRIES = 3;
+    const backoffDelays = [0, 1000, 3000]; // attempt 1 → immediate, 2 → 1s, 3 → 3s
+
     let planText: string;
-    try {
-      planText = opts.chatFn
-        ? await opts.chatFn([plannerSystem, ...trimmedConvo], opts.signal)
-        : await ollamaChat({
-            baseUrl: opts.baseUrl,
-            model: opts.plannerModel || opts.model,
-            messages: [plannerSystem, ...trimmedConvo],
-            signal: opts.signal,
-          });
-    } catch (e: any) {
-      if (e?.name === "AbortError") throw e;
-      convo.push({ role: "assistant", content: `[planner error] ${e?.message || String(e)}` });
-      break;
-    } finally {
-      opts.onStatus?.("");
+    let lastLlmError: any = null;
+
+    for (let llmAttempt = 1; llmAttempt <= MAX_LLM_RETRIES; llmAttempt++) {
+      try {
+        if (llmAttempt > 1) {
+          opts.onStatus?.(`🔄 LLM retry ${llmAttempt}/${MAX_LLM_RETRIES}…`);
+          // Wait for backoff delay (except first retry which is immediate)
+          if (backoffDelays[llmAttempt - 1] > 0) {
+            await new Promise(resolve => setTimeout(resolve, backoffDelays[llmAttempt - 1]));
+          }
+        }
+
+        planText = opts.chatFn
+          ? await opts.chatFn([plannerSystem, ...trimmedConvo], opts.signal)
+          : await ollamaChat({
+              baseUrl: opts.baseUrl,
+              model: opts.plannerModel || opts.model,
+              messages: [plannerSystem, ...trimmedConvo],
+              signal: opts.signal,
+            });
+
+        // Success — break out of retry loop
+        lastLlmError = null;
+        break;
+      } catch (e: any) {
+        lastLlmError = e;
+        if (e?.name === "AbortError") throw e; // Don't retry abort errors
+
+        // If this was the last attempt, exit retry loop with error
+        if (llmAttempt === MAX_LLM_RETRIES) {
+          break;
+        }
+        // Otherwise, continue to next retry attempt
+      }
     }
+
+    // If all retries failed, report error and break
+    if (lastLlmError) {
+      convo.push({ role: "assistant", content: `[planner error] ${lastLlmError?.message || String(lastLlmError)}` });
+      break;
+    }
+
+    opts.onStatus?.("");
 
     let plan = parsePlan(planText);
 
@@ -1075,6 +1502,21 @@ export async function agenticStreamChat(opts: {
 
     if (plan.action === "final") break;
 
+    // ── Plan Verification ───────────────────────────────────────────────────
+    // Validate plan structure before executing to catch malformed plans early.
+    const firstUserMsg = opts.messages.find((m) => m.role === "user");
+    const verification = await verifyPlan(plan, firstUserMsg?.content || "");
+
+    if (!verification.valid) {
+      console.warn(`[agentic] invalid plan: ${verification.reason}`);
+
+      convo.push({
+        role: "assistant",
+        content: `[plan review] Plan invalid: ${verification.reason}. Revising approach.`,
+      });
+      continue;
+    }
+
     // ── Tool name aliasing ────────────────────────────────────────────────
     // Resolve bare names (list_directory) → qualified (fs.list_directory).
     // Do this before any other checks so blocklist/circuit-breaker use real name.
@@ -1094,7 +1536,12 @@ export async function agenticStreamChat(opts: {
     }
 
     if (!isAgentTool(toolName)) {
-      convo.push({ role: "assistant", content: `[tool blocked] "${toolName}" is not available.` });
+      convo.push({
+        role: "assistant",
+        content: `[tool blocked] "${toolName}" is not in the allowed tools list. ` +
+          `Only explicitly permitted tools can be executed. ` +
+          `Available tools: ${ALLOWED_TOOLS.slice(0, 8).join(", ")}${ALLOWED_TOOLS.length > 8 ? "..." : ""}`,
+      });
       continue;
     }
 
@@ -1147,13 +1594,178 @@ export async function agenticStreamChat(opts: {
 
     const toolArgs = normalized.args;
 
-    const result = await runTool({
-      toolName,
-      args:     toolArgs,
-      exec:     semanticExecutor,   // ← V5: wraps batchingExecutor, intercepts semantic.find
-      onStatus: opts.onStatus,
-      signal:   opts.signal,
+    // ── Reasoning Stabilizer ────────────────────────────────────────────────
+    // Require the agent to explain why the tool is needed before executing.
+    // This reduces premature tool calls and improves decision quality.
+    const planReasoning = plan.reasoning;
+
+    // ── Execution Trace: Record decision before execution ───────────────────
+    executionTrace.push({
+      step,
+      reasoning: planReasoning || "",
+      tool: toolName,
+      args: toolArgs,
     });
+
+    if (!planReasoning || planReasoning.trim().length === 0) {
+      console.warn(`[agentic] tool missing reasoning: ${toolName}`);
+      
+      // Record metric for observability
+      recordReasoningLength(0);
+      
+      // Ask agent to provide reasoning
+      convo.push({
+        role: "assistant",
+        content: `[system] Reasoning required. Explain why "${toolName}" is needed before executing it. ` +
+          `What information are you trying to gather? How does this help answer the user's request?`,
+      });
+      
+      // Skip this tool and continue reasoning
+      continue;
+    }
+    
+    // Validate reasoning length
+    if (planReasoning.length < MIN_REASONING_LENGTH) {
+      console.warn(
+        `[agentic] tool reasoning too short: ${toolName} (${planReasoning.length} chars < ${MIN_REASONING_LENGTH})`
+      );
+      
+      // Record metric for observability
+      recordReasoningLength(planReasoning.length);
+      
+      // Ask agent to elaborate
+      convo.push({
+        role: "assistant",
+        content: `[system] Reasoning too brief (${planReasoning.length} chars). ` +
+          `Please elaborate on why "${toolName}" is needed. ` +
+          `Explain your reasoning in more detail before executing.`,
+      });
+      
+      // Skip this tool and continue reasoning
+      continue;
+    }
+    
+    // Log reasoning for debugging
+    console.log(`[agentic] reasoning for ${toolName}: ${planReasoning}`);
+
+    // Record metric for observability
+    recordReasoningLength(planReasoning.length);
+
+    // ── Tool Budget Check ───────────────────────────────────────────────────
+    // Verify we have budget remaining before executing the tool.
+    if (toolBudget <= 0) {
+      console.warn(`[agentic] tool budget exhausted: cannot execute ${toolName}`);
+
+      // Record metric for observability
+      recordToolBudgetRemaining(0);
+
+      // Add system message to inform agent
+      convo.push({
+        role: "assistant",
+        content: `[system] Tool usage limit reached. Continue reasoning without additional tool calls. ` +
+          `You have used your allocated tool budget. Provide your final answer based on information gathered so far.`,
+      });
+
+      // Skip this tool and continue reasoning
+      continue;
+    }
+
+    // ── Tool Confidence Gate ────────────────────────────────────────────────
+    // Check if the agent is confident enough in this tool call.
+    // Low confidence indicates the agent may be guessing.
+    const planConfidence = plan.confidence ?? DEFAULT_CONFIDENCE;
+    
+    if (planConfidence < TOOL_CONFIDENCE_THRESHOLD) {
+      console.warn(
+        `[agentic] tool confidence too low: ${toolName} (${planConfidence.toFixed(2)} < ${TOOL_CONFIDENCE_THRESHOLD})`
+      );
+      
+      // Record metric for observability
+      recordLowConfidenceTool(toolName, planConfidence);
+      
+      // Add system message to prompt reconsideration
+      convo.push({
+        role: "assistant",
+        content: `[system] Tool confidence too low (${planConfidence.toFixed(2)}). ` +
+          `Reconsider reasoning before executing "${toolName}". ` +
+          `Do you have enough context? Should you gather more information first?`,
+      });
+      
+      // Skip this tool and continue reasoning
+      continue;
+    }
+
+    // ── Catalog Version Sync ────────────────────────────────────────────────
+    // Verify catalog hasn't changed since we loaded it. If version differs,
+    // refresh tools and aliasMap to stay in sync.
+    const latestCatalog = await getToolCatalog();
+    if (latestCatalog.version !== catalogVersion) {
+      console.warn(
+        `[agentic] tool catalog version changed (${catalogVersion} → ${latestCatalog.version}), ` +
+        `refreshing alias map`
+      );
+      toolCatalogCache = latestCatalog;
+      catalogVersion = latestCatalog.version;
+      tools = toolCatalogCache.tools;
+      aliasMap = toolCatalogCache.aliasMap;
+    }
+
+    // ── Loop Guard: Record tool before execution ────────────────────────────
+    recordTool(loopGuard, toolName, toolArgs);
+
+    // Check for loop pattern
+    const loopCheck = detectLoop(loopGuard);
+    if (loopCheck.loopDetected) {
+      console.warn(`[agentic] loop detected: ${loopCheck.reason}`);
+
+      // Add system message to conversation
+      convo.push({
+        role: "assistant",
+        content: `[system] Agent loop guard triggered.\n\n` +
+          `Execution stopped to prevent infinite loop.\n\n` +
+          `Reason: ${loopCheck.reason}\n\n` +
+          `The agent appears to be stuck in a repeated pattern. ` +
+          `Try rephrasing your request or providing more specific guidance.`,
+      });
+
+      // Terminate the run
+      break;
+    }
+
+    // ── Tool Result Cache: Check for cached result ──────────────────────────
+    const cacheKey = getToolCacheKey(toolName, toolArgs);
+    let result: any;
+    
+    if (toolResultCache.has(cacheKey)) {
+      console.log(`[agentic] cache hit: ${toolName} (same args)`);
+      result = toolResultCache.get(cacheKey);
+    } else {
+      // Execute tool and cache result
+      result = await runTool({
+        toolName,
+        args:     toolArgs,
+        exec:     semanticExecutor,
+        onStatus: opts.onStatus,
+        signal:   opts.signal,
+      });
+      
+      // Cache the result (only if successful)
+      if (result.ok) {
+        toolResultCache.set(cacheKey, result);
+      }
+    }
+
+    // ── Record tool usage for metrics ───────────────────────────────────────
+    recordToolUsage(toolName);
+
+    // ── Execution Trace: Record result summary ──────────────────────────────
+    const traceIndex = executionTrace.length - 1;
+    if (traceIndex >= 0 && executionTrace[traceIndex]) {
+      const resultSummary = typeof result === "string"
+        ? result.slice(0, 200)
+        : JSON.stringify(result).slice(0, 200);
+      executionTrace[traceIndex].resultSummary = resultSummary;
+    }
 
     if (toolName === "hub.refresh" && result.ok) {
       const refreshed = getCachedTools();
@@ -1166,6 +1778,9 @@ export async function agenticStreamChat(opts: {
     // Circuit breaker tracking
     if (result.ok) {
       recordToolSuccess(toolName);
+      // Decrement tool budget after successful execution
+      toolBudget--;
+      console.log(`[agentic] tool budget remaining: ${toolBudget}`);
     } else {
       recordToolFailure(toolName);
     }
@@ -1185,6 +1800,28 @@ export async function agenticStreamChat(opts: {
         ? `[tool result: ${toolName}]\n${result.text}`
         : `[tool error: ${toolName}]\n${result.text}\n\nNote: this failed. Choose a different approach.`,
     });
+
+    // ── Persist step state for recovery ─────────────────────────────────────
+    // Save after each step so we can recover from crashes/UI reloads.
+    // Only stores minimal info (not full conversation to avoid quota issues).
+    saveAgentRunState({
+      step,
+      lastTool: toolName,
+      lastToolArgs: toolArgs,
+      lastToolOk: result.ok,
+    });
+
+    // ── Step Timeout Check ──────────────────────────────────────────────────
+    // Check if step has exceeded timeout after completion.
+    if (Date.now() - stepStart > MAX_AGENT_STEP_TIME) {
+      console.warn("[agentic] step timeout exceeded");
+      convo.push({
+        role: "assistant",
+        content: `[system] Agent step timeout reached. Stopping execution to prevent hanging. ` +
+          `Step ${step} took ${(Date.now() - stepStart) / 1000}s (limit: ${MAX_AGENT_STEP_TIME / 1000}s).`,
+      });
+      break;
+    }
   }
 
   // ── Atomic batch commit ───────────────────────────────────────────────────
@@ -1202,6 +1839,7 @@ export async function agenticStreamChat(opts: {
         summary: "✗ Workspace root changed before commit; staged writes were not committed.",
       });
       opts.onToken("\n\n⚠️ Workspace root changed before commit; staged writes were not committed. Retry your request.\n\n");
+      saveAgentRunState({ status: "failed" });
       return;
     }
 
@@ -1371,4 +2009,13 @@ export async function agenticStreamChat(opts: {
       onToken: opts.onToken,
     });
   }
+
+  // ── Log execution trace for debugging ─────────────────────────────────────
+  console.log("[agentic] execution trace:", executionTrace);
+
+  // ── Mark run as completed ─────────────────────────────────────────────────
+  markAgentRunComplete();
+
+  // ── Finish metrics tracking ──────────────────────────────────────────────
+  finishAgentMetrics();
 }

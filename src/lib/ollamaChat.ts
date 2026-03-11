@@ -1,4 +1,18 @@
 import { invoke } from "@tauri-apps/api/tauri";
+import { ollamaHealth } from "./ollamaHealth";
+import { llmQueue } from "./llmQueue";
+
+// ── Timeout Helper ────────────────────────────────────────────────────────────
+// Wraps a promise with a timeout to prevent hanging requests.
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error("LLM request timeout")), ms)
+    )
+  ]);
+}
 
 export type OllamaMsg = {
   role: "system" | "user" | "assistant";
@@ -25,36 +39,50 @@ export async function ollamaChat(opts: {
   const base = norm(opts.baseUrl);
   if (!base) throw new Error("Ollama base URL is empty.");
 
+  // ── Model Fallback ──────────────────────────────────────────────────────────
+  // Resolve best available model using health monitor fallback chain.
+  const model = await ollamaHealth.resolveModel(opts.model);
+
   const body = {
-    model: opts.model,
+    model: model,
     messages: opts.messages,
     stream: false,
   };
 
-  // ✅ Tauri path (MSI/EXE safe)
-  if (isTauri()) {
-    const out: any = await invoke("ollama_chat_once", { baseUrl: base, body });
-    const text =
-      out?.message?.content ??
-      out?.response ??
-      out?.output ??
-      "";
-    return String(text || "");
-  }
+  // ── LLM Request Queue ──────────────────────────────────────────────────────
+  // Wrap request to prevent concurrent overload.
+  return llmQueue.run(async () => {
+    // ── LLM Request Timeout ──────────────────────────────────────────────────
+    // Prevent hanging requests with 30 second timeout.
+    const request = (async () => {
+      // ✅ Tauri path (MSI/EXE safe)
+      if (isTauri()) {
+        const out: any = await invoke("ollama_chat_once", { baseUrl: base, body });
+        const text =
+          out?.message?.content ??
+          out?.response ??
+          out?.output ??
+          "";
+        return String(text || "");
+      }
 
-  // Browser fallback
-  const r = await fetch(`${base}/api/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal: opts.signal,
+      // Browser fallback
+      const r = await fetch(`${base}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: opts.signal,
+      });
+
+      if (!r.ok) {
+        const t = await r.text().catch(() => "");
+        throw new Error(`Ollama chat failed (${r.status}): ${t}`);
+      }
+
+      const j: any = await r.json();
+      return String(j?.message?.content ?? j?.response ?? "");
+    })();
+
+    return withTimeout(request, 30000);
   });
-
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`Ollama chat failed (${r.status}): ${t}`);
-  }
-
-  const j: any = await r.json();
-  return String(j?.message?.content ?? j?.response ?? "");
 }

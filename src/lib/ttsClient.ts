@@ -19,6 +19,54 @@ if (isTauri) {
   import("@tauri-apps/api/tauri").then((m) => { tauriInvoke = m.invoke; }).catch(() => {});
 }
 
+// ── Markdown Stripping for TTS ────────────────────────────────────────────────
+// Removes markdown syntax from text before sending to speech engine.
+// Prevents TTS from reading "**bold**" as "star star bold star star".
+
+export function stripMarkdownForTTS(text: string): string {
+  return text
+    // fenced code blocks
+    .replace(/```[\s\S]*?```/g, " code block ")
+
+    // inline code
+    .replace(/`([^`]+)`/g, "$1")
+
+    // headings
+    .replace(/#{1,6}\s+/g, "")
+
+    // bold
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+
+    // italic
+    .replace(/\*(.+?)\*/g, "$1")
+
+    // strikethrough
+    .replace(/~~(.+?)~~/g, "$1")
+
+    // markdown links
+    .replace(/\[(.+?)\]\(.+?\)/g, "$1")
+
+    // bullet lists
+    .replace(/^[-*+]\s+/gm, "")
+
+    // numbered lists
+    .replace(/^\d+\.\s+/gm, "")
+
+    // blockquotes
+    .replace(/^>\s+/gm, "")
+
+    // paragraph spacing
+    .replace(/\n{2,}/g, ". ")
+
+    // single line breaks
+    .replace(/\n/g, " ")
+
+    // collapse multiple spaces
+    .replace(/\s{2,}/g, " ")
+
+    .trim();
+}
+
 // ── Audio state ───────────────────────────────────────────────────────────────
 
 let currentAudio: HTMLAudioElement | null = null;
@@ -42,11 +90,17 @@ export async function ttsSpeak(text: string, settings: VoiceSettings): Promise<v
 
   if (!text?.trim()) return;
 
+  // ── Strip markdown syntax before speech ───────────────────────────────────
+  // Prevents TTS from reading markdown characters literally.
+  const cleanText = stripMarkdownForTTS(text.trim());
+
+  if (!cleanText) return;
+
   // ── Tauri path: call piper directly via Rust ──────────────────────────────
   // voice_tts_speak(text) → Vec<u8> (WAV bytes)
   // No HTTP server needed. Piper is called as a subprocess per request.
   if (isTauri && tauriInvoke) {
-    const wavBytes = await tauriInvoke<number[]>("voice_tts_speak", { text: text.trim(), speed: Number(settings.ttsSpeed ?? 1.0) });
+    const wavBytes = await tauriInvoke<number[]>("voice_tts_speak", { text: cleanText, speed: Number(settings.ttsSpeed ?? 1.0) });
     const blob = new Blob([new Uint8Array(wavBytes)], { type: "audio/wav" });
     const url  = URL.createObjectURL(blob);
 
@@ -80,7 +134,7 @@ export async function ttsSpeak(text: string, settings: VoiceSettings): Promise<v
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      text:   text.trim(),
+      text:   cleanText,
       speed:  Number(settings.ttsSpeed ?? 1.0),
     }),
   });

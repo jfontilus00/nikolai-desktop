@@ -2,7 +2,9 @@ use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-  collections::HashMap,
+  collections::{HashMap, HashSet},
+  fs,
+  path::PathBuf,
   process::Stdio,
   sync::{
     atomic::{AtomicU64, Ordering},
@@ -91,6 +93,180 @@ static MCP: OnceCell<Mutex<McpState>> = OnceCell::new();
 
 fn ensure_state() -> &'static Mutex<McpState> {
   MCP.get_or_init(|| Mutex::new(McpState::Disconnected))
+}
+
+// ── Tool Schema Cache for Validation ─────────────────────────────────────────
+// Stores tool name -> inputSchema mapping for argument validation.
+// Updated on each mcp_list_tools() call.
+static MCP_TOOL_SCHEMAS: OnceCell<Mutex<HashMap<String, Value>>> = OnceCell::new();
+
+fn ensure_tool_schemas() -> &'static Mutex<HashMap<String, Value>> {
+  MCP_TOOL_SCHEMAS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// ── JSON Schema Validation for Tool Arguments ────────────────────────────────
+// Basic validation without external crate dependencies.
+// Validates: required properties, property types, additional properties.
+
+fn validate_tool_args(tool_name: &str, args: &Value, schema_opt: Option<&Value>) -> Result<(), String> {
+  // No schema = no validation (allow passthrough)
+  let schema = match schema_opt {
+    Some(s) => s,
+    None => return Ok(()),
+  };
+
+  // Schema must be an object
+  let schema_obj = schema.as_object()
+    .ok_or_else(|| format!("Tool '{}' has invalid schema (not an object)", tool_name))?;
+
+  // Empty schema = allow anything
+  if schema_obj.is_empty() {
+    return Ok(());
+  }
+
+  // Args must be an object if schema expects one
+  let args_obj = args.as_object()
+    .ok_or_else(|| {
+      // Special case: if schema allows any type, allow non-object args
+      if schema_obj.get("type").and_then(|t| t.as_str()) == Some("object") ||
+         schema_obj.contains_key("properties") ||
+         schema_obj.contains_key("required") {
+        format!("Tool '{}' arguments must be an object, got {:?}", tool_name, 
+                if args.is_null() { "null" } else if args.is_array() { "array" } else { "primitive" })
+      } else {
+        String::new() // No type constraint
+      }
+    })?;
+
+  // Check required properties
+  if let Some(required) = schema_obj.get("required").and_then(|r| r.as_array()) {
+    for req_val in required {
+      if let Some(req_key) = req_val.as_str() {
+        if !args_obj.contains_key(req_key) {
+          return Err(format!(
+            "Tool '{}' missing required argument: '{}'",
+            tool_name, req_key
+          ));
+        }
+      }
+    }
+  }
+
+  // Validate property types
+  if let Some(properties) = schema_obj.get("properties").and_then(|p| p.as_object()) {
+    for (key, value) in args_obj {
+      if let Some(prop_schema) = properties.get(key) {
+        if let Some(prop_schema_obj) = prop_schema.as_object() {
+          if let Some(expected_type) = prop_schema_obj.get("type").and_then(|t| t.as_str()) {
+            let actual_type = match value {
+              Value::Null => "null",
+              Value::Bool(_) => "boolean",
+              Value::Number(_) => "number",
+              Value::String(_) => "string",
+              Value::Array(_) => "array",
+              Value::Object(_) => "object",
+            };
+
+            // Handle type arrays (e.g., ["string", "null"])
+            let type_matches = if expected_type == "integer" {
+              actual_type == "number" && value.as_i64().is_some()
+            } else if expected_type == "number" {
+              actual_type == "number"
+            } else {
+              actual_type == expected_type
+            };
+
+            if !type_matches {
+              return Err(format!(
+                "Tool '{}' argument '{}' has wrong type: expected {}, got {}",
+                tool_name, key, expected_type, actual_type
+              ));
+            }
+          }
+
+          // Check enum constraint
+          if let Some(enum_values) = prop_schema_obj.get("enum").and_then(|e| e.as_array()) {
+            if !enum_values.contains(value) {
+              return Err(format!(
+                "Tool '{}' argument '{}' has invalid value: {:?}. Allowed: {:?}",
+                tool_name, key, value, enum_values
+              ));
+            }
+          }
+
+          // Check minimum for numbers
+          if let Some(min) = prop_schema_obj.get("minimum").and_then(|m| m.as_f64()) {
+            if let Some(num) = value.as_f64() {
+              if num < min {
+                return Err(format!(
+                  "Tool '{}' argument '{}' is {} but minimum is {}",
+                  tool_name, key, num, min
+                ));
+              }
+            }
+          }
+
+          // Check maximum for numbers
+          if let Some(max) = prop_schema_obj.get("maximum").and_then(|m| m.as_f64()) {
+            if let Some(num) = value.as_f64() {
+              if num > max {
+                return Err(format!(
+                  "Tool '{}' argument '{}' is {} but maximum is {}",
+                  tool_name, key, num, max
+                ));
+              }
+            }
+          }
+
+          // Check minLength for strings
+          if let Some(min_len) = prop_schema_obj.get("minLength").and_then(|m| m.as_u64()) {
+            if let Some(s) = value.as_str() {
+              if (s.len() as u64) < min_len {
+                return Err(format!(
+                  "Tool '{}' argument '{}' is too short (min {} chars)",
+                  tool_name, key, min_len
+                ));
+              }
+            }
+          }
+
+          // Check maxLength for strings
+          if let Some(max_len) = prop_schema_obj.get("maxLength").and_then(|m| m.as_u64()) {
+            if let Some(s) = value.as_str() {
+              if s.len() as u64 > max_len {
+                return Err(format!(
+                  "Tool '{}' argument '{}' is too long (max {} chars)",
+                  tool_name, key, max_len
+                ));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Check additionalProperties (if explicitly set to false)
+  if let Some(additional) = schema_obj.get("additionalProperties") {
+    if additional == &Value::Bool(false) {
+      let allowed_keys: HashSet<&String> = schema_obj
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .map(|p: &serde_json::Map<std::string::String, Value>| p.keys().collect())
+        .unwrap_or_default();
+
+      for key in args_obj.keys() {
+        if !allowed_keys.contains(key) {
+          return Err(format!(
+            "Tool '{}' does not allow additional argument: '{}'",
+            tool_name, key
+          ));
+        }
+      }
+    }
+  }
+
+  Ok(())
 }
 
 fn now_millis() -> u64 {
@@ -569,6 +745,12 @@ pub async fn mcp_list_tools() -> Result<Vec<McpTool>, String> {
   let v = request("tools/list", json!({})).await?;
   let tools = v.get("tools").cloned().unwrap_or(Value::Array(vec![]));
 
+  // ── Cache tool schemas for validation ──────────────────────────────────────
+  // Update the global schema cache with latest tool definitions.
+  let schemas = ensure_tool_schemas();
+  let mut guard = schemas.lock().await;
+  guard.clear();
+
   let mut out: Vec<McpTool> = vec![];
   if let Value::Array(arr) = tools {
     for t in arr {
@@ -578,9 +760,16 @@ pub async fn mcp_list_tools() -> Result<Vec<McpTool>, String> {
       }
       let description = t.get("description").and_then(|x| x.as_str()).map(|s| s.to_string());
       let input_schema = t.get("inputSchema").cloned().or_else(|| t.get("input_schema").cloned());
+      
+      // Cache schema for validation
+      if let Some(schema) = t.get("inputSchema").cloned().or_else(|| t.get("input_schema").cloned()) {
+        guard.insert(name.clone(), schema);
+      }
+      
       out.push(McpTool { name, description, input_schema });
     }
   }
+  drop(guard); // Release lock early
 
   Ok(out)
 }
@@ -597,6 +786,29 @@ pub async fn mcp_call_tool(name: String, args: Value, app: AppHandle) -> Result<
     "tool": name,
     "ts":   now_millis()
   }));
+
+  // ── JSON Schema Validation ─────────────────────────────────────────────────
+  // Validate tool arguments against the tool's inputSchema BEFORE forwarding
+  // to the MCP server. This catches malformed args early and prevents invalid
+  // requests from reaching external MCP servers.
+  let schemas = ensure_tool_schemas();
+  let guard = schemas.lock().await;
+  let schema_opt = guard.get(&name).cloned();
+  drop(guard); // Release lock before validation
+
+  if let Some(schema) = schema_opt {
+    if let Err(err) = validate_tool_args(&name, &args, Some(&schema)) {
+      // Emit "done" with error phase for consistency
+      let _ = app.emit_all("mcp://tool-progress", json!({
+        "phase": "error",
+        "tool": name,
+        "ok":   false,
+        "error": err.clone(),
+        "ts":   now_millis()
+      }));
+      return Err(err);
+    }
+  }
 
   let result = request(
     "tools/call",
@@ -616,4 +828,97 @@ pub async fn mcp_call_tool(name: String, args: Value, app: AppHandle) -> Result<
   }));
 
   result.map(|v| v)
+}
+
+#[tauri::command]
+pub fn mcp_prepare_hub_config(
+  app: AppHandle,
+  config_path: String,
+  cwd: Option<String>,
+  allowed_dirs: Vec<String>,
+) -> Result<String, String> {
+  let resolved: PathBuf = {
+    let p = PathBuf::from(&config_path);
+    if p.is_absolute() {
+      p
+    } else if let Some(cwd) = cwd {
+      PathBuf::from(cwd).join(p)
+    } else {
+      return Err("hub config path is relative but no cwd provided".to_string());
+    }
+  };
+
+  let mut dirs: Vec<String> = Vec::new();
+  for d in allowed_dirs {
+    let mut p = d.trim().trim_matches('"').trim_matches('\'').to_string();
+    if p.starts_with("\\\\?\\") { p = p[4..].to_string(); }
+    if p.starts_with("//?/") { p = p[4..].to_string(); }
+    p = p.replace("\\", "/");
+    while p.contains("//") { p = p.replace("//", "/"); }
+    if p.len() == 3 && p.ends_with(":/") {
+      // keep root like "c:/"
+    } else {
+      while p.ends_with("/") { p.pop(); }
+    }
+    if p.len() >= 2 && p.as_bytes()[1] == b':' {
+      let mut chars: Vec<char> = p.chars().collect();
+      chars[0] = chars[0].to_ascii_lowercase();
+      p = chars.into_iter().collect();
+    }
+    if !p.is_empty() && !dirs.contains(&p) { dirs.push(p); }
+  }
+
+  let mut roots: Vec<String> = Vec::new();
+  for d in &dirs {
+    let mut s = d.replace("/", "\\");
+    if s.len() >= 2 && s.as_bytes()[1] == b':' {
+      let mut chars: Vec<char> = s.chars().collect();
+      chars[0] = chars[0].to_ascii_uppercase();
+      s = chars.into_iter().collect();
+    }
+    roots.push(s);
+  }
+  let roots_joined = roots.join(";");
+
+  let raw = fs::read_to_string(&resolved)
+    .map_err(|e| format!("read hub config failed: {}", e))?;
+  let mut v: Value = serde_json::from_str(&raw)
+    .map_err(|e| format!("parse hub config failed: {}", e))?;
+
+  let mut updated = false;
+  if let Some(servers) = v.get_mut("servers").and_then(|s| s.as_array_mut()) {
+    for srv in servers.iter_mut() {
+      let obj = match srv.as_object_mut() { Some(o) => o, None => continue };
+      let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("");
+      let label = obj.get("label").and_then(|v| v.as_str()).unwrap_or("");
+      let cwd = obj.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+      let args_match = obj.get("args")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|a| a.as_str()).any(|s| s.contains("filesystem")))
+        .unwrap_or(false);
+      let is_fs = id == "fs" || label == "filesystem" || cwd.contains("filesystem") || args_match;
+      if is_fs {
+        let env = obj.entry("env").or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(env_obj) = env.as_object_mut() {
+          env_obj.insert("WORKSPACE_ROOTS".to_string(), Value::String(roots_joined.clone()));
+          updated = true;
+        }
+      }
+    }
+  }
+
+  if !updated {
+    return Err("no filesystem server entry found in hub config".to_string());
+  }
+
+  let runtime_dir = app
+    .path_resolver()
+    .app_data_dir()
+    .ok_or_else(|| "failed to resolve app data dir".to_string())?
+    .join("mcp");
+  fs::create_dir_all(&runtime_dir).map_err(|e| format!("create runtime dir failed: {}", e))?;
+  let runtime_path = runtime_dir.join("mcp-hub.runtime.json");
+  let out = serde_json::to_string_pretty(&v).map_err(|e| format!("serialize hub config failed: {}", e))?;
+  fs::write(&runtime_path, out).map_err(|e| format!("write runtime config failed: {}", e))?;
+  Ok(runtime_path.to_string_lossy().to_string())
 }
