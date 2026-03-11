@@ -8,6 +8,7 @@ import { loadMemory, formatMemoryForPrompt, addFact } from "./memory";
 import { loadIndex, searchIndex, formatSearchResults, type SemanticIndex } from "./semanticIndex";
 import { startAgentMetrics, incrementStep, recordToolUsage, finishAgentMetrics, recordLowConfidenceTool, recordReasoningLength, recordToolBudgetRemaining } from "./agent_metrics";
 import { createLoopGuard, recordTool, detectLoop, type LoopGuardState } from "./agent_loop_guard";
+import { reflectOnToolResult } from "./toolReflection";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -1753,6 +1754,33 @@ export async function agenticStreamChat(opts: {
       if (result.ok) {
         toolResultCache.set(cacheKey, result);
       }
+    }
+
+    // ── Tool Reflection ──────────────────────────────────────────────────────
+    // Evaluate tool result to help agent understand what happened.
+    try {
+      const reflection = await reflectOnToolResult(
+        toolName,
+        JSON.stringify(result).slice(0, 2000),
+        async (msgs) => {
+          const reflectionPlanText = opts.chatFn
+            ? await opts.chatFn(msgs, opts.signal)
+            : await ollamaChat({
+                baseUrl: opts.baseUrl,
+                model: opts.plannerModel || opts.model,
+                messages: msgs,
+                signal: opts.signal,
+              });
+          return reflectionPlanText;
+        }
+      );
+
+      if (reflection) {
+        console.log("[agentic reflection]", reflection);
+      }
+
+    } catch (err) {
+      console.warn("[agentic] reflection skipped", err);
     }
 
     // ── Record tool usage for metrics ───────────────────────────────────────
