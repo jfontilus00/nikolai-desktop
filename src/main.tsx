@@ -5,6 +5,7 @@ import "./index.css";
 import { appWindow } from "@tauri-apps/api/window";
 import { saveAgentRunState } from "./lib/agentic";
 import { ollamaHealth } from "./lib/ollamaHealth";
+import { ttsPrimeVoice } from "./lib/ttsClient";
 
 // ── Ollama Health Monitor ─────────────────────────────────────────────────────
 // Starts monitoring Ollama server health on app startup.
@@ -44,3 +45,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
     <App />
   </React.StrictMode>
 );
+
+// Warm up Piper silently 3 seconds after UI loads
+// Delay ensures the app is fully visible before the background work starts
+setTimeout(() => {
+  ttsPrimeVoice().catch(() => {});
+}, 3000);

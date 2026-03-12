@@ -27,7 +27,84 @@ import { withTimeout } from "./lib/timeout";
 
 // Voice
 import { loadVoiceSettings } from "./lib/voiceSettings";
-import { ttsSpeak } from "./lib/ttsClient";
+import { ttsSpeak, ttsSpeakQueued } from "./lib/ttsClient";
+
+// ── Sentence boundary detection ────────────────────────────────────────────
+// Handles abbreviations, decimals, URLs, ellipsis, and initials
+// without relying on a single naive regex.
+
+const ABBREVS = new Set([
+  "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs",
+  "etc", "eg", "ie", "approx", "dept", "est", "govt", "corp",
+  "inc", "ltd", "co", "fig", "no", "vol", "pp", "sec",
+  "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep",
+  "oct", "nov", "dec",
+]);
+
+function splitSentences(text: string): string[] {
+  const results: string[] = [];
+  let buf = "";
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    buf += ch;
+
+    // Only evaluate potential sentence ends at . ! ?
+    if (ch !== "." && ch !== "!" && ch !== "?") continue;
+
+    // Ellipsis: collect all consecutive dots
+    if (ch === ".") {
+      let dots = 1;
+      while (i + dots < text.length && text[i + dots] === ".") {
+        buf += text[i + dots];
+        dots++;
+        i++;
+      }
+      if (dots >= 2) continue; // ellipsis — not a sentence end
+    }
+
+    // Must be followed by whitespace or end of string to be a real boundary
+    const next = text[i + 1];
+    if (next && next !== " " && next !== "\n" && next !== "\r") continue;
+
+    // Decimal numbers: digit before dot and digit would follow
+    if (ch === "." && i >= 1 && /\d/.test(text[i - 1])) {
+      const afterSpace = next === " " ? text[i + 2] : text[i + 1];
+      if (afterSpace && /\d/.test(afterSpace)) continue;
+    }
+
+    // URL detection: if we're inside a URL, skip
+    const beforeDot = buf.slice(-30).toLowerCase();
+    if (/https?:\/\/\S*$/.test(beforeDot)) continue;
+    if (/www\.\S*$/.test(beforeDot)) continue;
+
+    // Abbreviation detection: word before dot is a known abbreviation
+    if (ch === ".") {
+      const wordMatch = buf.slice(0, -1).match(/([a-zA-Z]+)$/);
+      if (wordMatch) {
+        const word = wordMatch[1].toLowerCase();
+        if (ABBREVS.has(word)) continue;
+        // Single capital letter (initials): A. B. U.S.A. etc.
+        if (/^[A-Z]$/.test(wordMatch[1])) continue;
+      }
+    }
+
+    // This is a real sentence boundary
+    const sentence = buf.trim();
+    if (sentence.length > 0) {
+      results.push(sentence);
+      buf = "";
+    }
+  }
+
+  // Remaining buffer (incomplete sentence, no terminal punctuation)
+  const remaining = buf.trim();
+  if (remaining.length > 0) {
+    results.push(remaining);
+  }
+
+  return results;
+}
 
 // ── Agentic trigger heuristic ─────────────────────────────────────────────────
 function shouldUseAgentic(text: string) {
@@ -179,6 +256,78 @@ export default function App() {
         const buf = buffers.get(messageId);
         if (!buf || buf.chatId !== chatId) return;
         buf.chunks.push(t);
+        // Sentence streaming detection
+        sentenceBufferRef.current += t;
+
+        // Use improved sentence boundary detection
+        const rawSentences = splitSentences(sentenceBufferRef.current);
+        // Only take complete sentences (last item may be incomplete if no terminal punctuation)
+        const sentences = rawSentences.length > 1
+          ? rawSentences.slice(0, -1)   // all but last (last may be incomplete)
+          : rawSentences[0]?.match(/[.!?]$/)  // or last if it ends with punctuation
+            ? rawSentences
+            : null;
+
+        // Keep incomplete last fragment in buffer
+        if (rawSentences.length > 1) {
+          sentenceBufferRef.current = rawSentences[rawSentences.length - 1] ?? "";
+        } else if (!rawSentences[0]?.match(/[.!?]$/)) {
+          // whole buffer is one incomplete sentence — leave it
+        } else {
+          sentenceBufferRef.current = "";
+        }
+
+        if (sentences && sentences.length > 0) {
+          for (const sentence of sentences) {
+            const clean = sentence.trim();
+            if (!clean) continue;
+
+            if (!spokenSentencesRef.current.has(clean)) {
+              spokenSentencesRef.current.add(clean);
+
+              const vs = loadVoiceSettings();
+
+              if (vs.autoSpeak && voiceSessionActiveRef.current) {
+                ttsSpeakQueued(clean, vs).catch((e) => {
+                  console.warn("[SENTENCE-TTS] failed:", e);
+                });
+              }
+            }
+          }
+        }
+
+        /* Early speech trigger — fires when the buffer grows long but punctuation hasn't arrived yet */
+        // Threshold: 80 chars gives ~400ms first-word latency (ChatGPT-level instant feel)
+        if (
+          sentenceBufferRef.current.length > 80 &&
+          sentenceBufferRef.current.length < 400 &&  // don't early-trigger a wall of text
+          !/[.!?]/.test(sentenceBufferRef.current)   // only when NO punctuation (sentences handles those)
+        ) {
+          const early = sentenceBufferRef.current.trim();
+
+          if (early && !spokenSentencesRef.current.has(early)) {
+
+            const now = Date.now();
+
+            if (now - lastEarlyTriggerRef.current > 800) {
+
+              spokenSentencesRef.current.add(early);
+              lastEarlyTriggerRef.current = now;
+
+              const vs = loadVoiceSettings();
+
+              if (vs.autoSpeak && voiceSessionActiveRef.current) {
+                ttsSpeakQueued(early, vs).catch((e) => {
+                  console.warn("[EARLY-SPEAK] failed:", e);
+                });
+                console.log(`[EARLY-SPEAK] triggered at ${early.length} chars: "${early.slice(0, 40)}..."`);
+              }
+
+              sentenceBufferRef.current = "";
+            }
+          }
+        }
+
         buf.pending = true;
         scheduleFlush(chatId, messageId);
       };
@@ -194,6 +343,30 @@ export default function App() {
       if (buf.rafId !== null) { cancelAnimationFrame(buf.rafId); buf.rafId = null; }
       flushStreamingBuffer(chatId, messageId, true);
       buffers.delete(messageId);
+      // Flush remaining sentence — check BEFORE clearing the dedup set
+      const remaining = sentenceBufferRef.current.trim();
+
+      const vs = loadVoiceSettings();
+
+      if (
+        remaining &&
+        !spokenSentencesRef.current.has(remaining) &&  // ← dedup check BEFORE clear
+        vs.autoSpeak &&
+        voiceSessionActiveRef.current
+      ) {
+        ttsSpeakQueued(remaining, vs).catch((e) => {
+          console.warn("[FINAL-SPEAK] failed:", e);
+        });
+      }
+
+      if (spokenSentencesRef.current.size > 0) {
+        streamingSpokeSomethingRef.current = true;
+      }
+
+      // Clean up all streaming state — AFTER the remaining check
+      sentenceBufferRef.current = "";
+      spokenSentencesRef.current.clear();
+      lastEarlyTriggerRef.current = 0;
     },
     [flushStreamingBuffer]
   );
@@ -387,7 +560,7 @@ export default function App() {
     if (choice === "chat") {
       setToolAllowInChat((prev) => {
         const next = { ...prev, [`${activeId || "nochat"}::${name}`]: true };
-        try { sessionStorage.setItem("nikolai.tool.allow", JSON.stringify(next)); } catch {}
+        try { sessionStorage.setItem("nikolai.tool.allow", JSON.stringify(next)); } catch (e) { console.warn("[APP] sessionStorage write failed:", e); }
         return next;
       });
     }
@@ -395,6 +568,9 @@ export default function App() {
   };
 
   const activeChat = useMemo(() => chats.find((c) => c.id === activeId) || null, [chats, activeId]);
+
+  // Thinking indicator: show when streaming but no content yet
+  const isThinking = isStreaming && activeChat && activeChat.messages.length > 0 && !activeChat.messages[activeChat.messages.length - 1]?.content;
 
   const persist = (next: ChatThread[], nextActive?: string | null) => {
     setChats(next);
@@ -416,6 +592,8 @@ export default function App() {
   };
 
   const deleteChat = (id: string) => {
+    const c = chats.find((c) => c.id === id);
+    if (!confirm(`Delete "${c?.title || "this chat"}"? This cannot be undone.`)) return;
     const next = chats.filter((c) => c.id !== id);
     persist(next, activeId === id ? (next[0]?.id ?? null) : activeId);
   };
@@ -462,6 +640,11 @@ export default function App() {
 
   // Tracks last spoken text to avoid re-speaking the same message on re-render
   const lastSpokenRef = useRef<string>("");
+  const streamingSpokeSomethingRef = useRef(false);
+  const sentenceBufferRef = useRef("");
+  const spokenSentencesRef = useRef<Set<string>>(new Set());
+  const lastEarlyTriggerRef = useRef(0);
+  const voiceSessionActiveRef = useRef<boolean>(false);
 
   // Truncates to 40 chars — enough to distinguish chats in the sidebar.
   const autoTitleChat = useCallback((chatId: string, userText: string) => {
@@ -476,10 +659,17 @@ export default function App() {
     });
   }, []);
 
-  async function maybeAutoSpeakLastAssistant(chatId?: string) {
+async function maybeAutoSpeakLastAssistant(chatId?: string) {
+    if (streamingSpokeSomethingRef.current) {
+      streamingSpokeSomethingRef.current = false;
+      return;
+    }
     try {
       const vs = loadVoiceSettings();
-      if (!vs.autoSpeak) return;
+      console.log("[AUTO-SPEAK:1] triggered, autoSpeak=", vs?.autoSpeak);
+      if (!vs.autoSpeak || !voiceSessionActiveRef.current) {
+        return;
+      }
       const all = loadChats();
       const id = chatId || loadActiveChatId();
       const thread = all.find((c) => c.id === id) || all[0];
@@ -491,15 +681,70 @@ export default function App() {
           !String(m.content).startsWith("__STATUS__:")
         );
       const text = (msg?.content || "").trim();
+      console.log("[AUTO-SPEAK:2] text to speak=", text.slice(0,60));
       if (!text || text === lastSpokenRef.current) return;
       lastSpokenRef.current = text;
+      console.log("[AUTO-SPEAK:3] calling ttsSpeak");
       await ttsSpeak(text, vs);
-      if (vs.autoListenAfterSpeak) {
-        const start = (window as any).__nikolai_voice_start;
-        if (typeof start === "function") setTimeout(() => { try { start(); } catch {} }, 250);
+      console.log("[AUTO-SPEAK:4] ttsSpeak done");
+    } catch (e) {
+      console.warn("[AUTO-SPEAK] failed:", e);
+    }
+}
+
+/**
+ * Register global TTS helper used by VoicePanel autoSpeak
+ */
+useEffect(() => {
+  // Called by VoicePanel when mic opens
+  (window as any).__nikolai_voice_session_start = () => {
+    voiceSessionActiveRef.current = true;
+    console.log("[VOICE] session activated — auto-speak enabled");
+  };
+
+  // Called by VoicePanel when mic closes
+  (window as any).__nikolai_voice_session_end = () => {
+    voiceSessionActiveRef.current = false;
+    console.log("[VOICE] session deactivated — auto-speak paused");
+  };
+
+  (window as any).__nikolai_tts_last = async () => {
+    try {
+      const vs = loadVoiceSettings();
+
+      if (!vs.autoSpeak || !voiceSessionActiveRef.current) {
+        return;
       }
-    } catch { }
-  }
+
+      const all = loadChats();
+      const id = loadActiveChatId();
+      const thread = all.find((c) => c.id === id) || all[0];
+
+      const msg = thread?.messages
+        ?.slice()
+        .reverse()
+        .find(
+          (m) =>
+            m.role === "assistant" &&
+            (m.content || "").trim().length > 0 &&
+            !String(m.content).startsWith("__STATUS__:")
+        );
+
+      const text = (msg?.content || "").trim();
+      if (!text) return;
+
+      await ttsSpeak(text, vs);
+    } catch (e) {
+      console.warn("[__nikolai_tts_last] failed:", e);
+    }
+  };
+
+  return () => {
+    delete (window as any).__nikolai_tts_last;
+    delete (window as any).__nikolai_voice_session_start;
+    delete (window as any).__nikolai_voice_session_end;
+  };
+}, []);
 
   const regenerateLast = async () => {
     const chat = activeChat;
@@ -800,6 +1045,7 @@ export default function App() {
               chat={activeChat}
               onSend={send}
               isStreaming={isStreaming}
+              isThinking={isThinking}
               onStop={stop}
               onRegenerate={regenerateLast}
               canRegenerate={!isStreaming}

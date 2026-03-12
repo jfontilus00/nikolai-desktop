@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { loadVoiceSettings, saveVoiceSettings, type VoiceSettings } from "../lib/voiceSettings";
 import { sttTranscribe, sttPing } from "../lib/sttClient";
-import { ttsSpeak, ttsStop } from "../lib/ttsClient";
+import { ttsSpeak, ttsStop, stopTTS } from "../lib/ttsClient";
 import { loadChats, loadActiveChatId } from "../lib/storage";
 
 // Tauri invoke guard
@@ -182,8 +182,16 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
     return () => {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
+      cleanupVad();
     };
   }, [s.pttEnabled, s.pttKey, recording]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Cleanup VAD on component unmount
+  useEffect(() => {
+    return () => {
+      cleanupVad();
+    };
+  }, []);
 
   function cleanupVad() {
     try {
@@ -198,15 +206,16 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
     setMicLevel(0);
   }
 
-  async function ping(url: string) {
-    setStatus(null);
-    try {
-      const r = await fetch(url, { method: "GET" });
-      setStatus(`Ping OK: ${r.status} ${url}`);
-    } catch (e: any) {
-      setStatus(`Ping FAILED: ${url} — ${e?.message || String(e)}`);
-    }
-  }
+  // Ping function disabled — unused variable removed
+  // async function ping(url: string) {
+  //   setStatus(null);
+  //   try {
+  //     const r = await fetch(url, { method: "GET" });
+  //     setStatus(`Ping OK: ${r.status} ${url}`);
+  //   } catch (e: any) {
+  //     setStatus(`Ping FAILED: ${url} — ${e?.message || String(e)}`);
+  //   }
+  // }
 
   function setupVad(stream: MediaStream) {
     cleanupVad();
@@ -245,6 +254,12 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
   }
 
   async function startRec() {
+    stopTTS();
+
+    // Activate voice session so App.tsx TTS triggers are enabled
+    const activate = (window as any).__nikolai_voice_session_start;
+    if (typeof activate === "function") activate();
+
     if (recording) return;
     setStatus(null); setLastTranscript("");
     try { ttsStop(); } catch {}
@@ -282,12 +297,18 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
           // autoListenAfterSpeak: if enabled, wait for TTS to finish then re-listen
           if (s.autoSpeak) {
             const speakFn = (window as any).__nikolai_tts_last;
+            console.log("[PANEL-SPEAK:1] autoSpeak block entered, speakFn=", typeof (window as any).__nikolai_tts_last);
             if (typeof speakFn === "function") {
               try {
                 setStatus("Speaking…");
+                console.log("[PANEL-SPEAK:2] calling speakFn");
                 await speakFn();
+                console.log("[PANEL-SPEAK:3] speakFn done");
                 setStatus("Done speaking.");
-              } catch { /* ignore TTS errors — don't break the loop */ }
+              } catch (e) {
+                console.log("[PANEL-SPEAK:ERR]", e);
+                setStatus(`Speech failed — check TTS server is running.`);
+              } /* ignore TTS errors — don't break the loop */
             }
           }
           if (s.autoListenAfterSpeak) {
@@ -295,6 +316,16 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
           }
         } catch (e: any) {
           setPhase("idle"); setStatus(e?.message || String(e));
+
+          // Auto-recover microphone when continuous mode enabled
+          const s = loadVoiceSettings();
+          if (s.autoListenAfterSpeak) {
+            setTimeout(() => {
+              try {
+                startRec();
+              } catch {}
+            }, 500);
+          }
         }
       };
       rec.start();
@@ -308,6 +339,10 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
   }
 
   async function stopRec() {
+    // Deactivate voice session — text chat will no longer trigger TTS
+    const deactivate = (window as any).__nikolai_voice_session_end;
+    if (typeof deactivate === "function") deactivate();
+
     try { recRef.current?.stop(); }    catch {}
     try { streamRef.current?.getTracks()?.forEach((t) => t.stop()); } catch {}
     recRef.current = null; streamRef.current = null;
@@ -764,6 +799,23 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
       </div>
 
       {status && <div className="text-xs text-amber-300">{status}</div>}
+
+      {status?.toLowerCase().includes("mic error") && (
+        <button
+          className="mt-2 px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold transition-colors"
+          onClick={startRec}
+          aria-label="Retry microphone permission"
+        >
+          Retry Mic Permission
+        </button>
+      )}
+
+      {phase === "transcribing" && (
+        <div className="flex items-center gap-2 text-xs text-white/50 mt-2">
+          <div className="w-3.5 h-3.5 border-2 border-white/20 border-t-white/60 rounded-full animate-spin" />
+          <span>Transcribing speech…</span>
+        </div>
+      )}
     </div>
   );
 }

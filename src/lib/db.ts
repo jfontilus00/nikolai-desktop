@@ -99,6 +99,12 @@ export async function saveMessage(
     [id, convId, role, content, ts]
   );
 
+  // Sync FTS index
+  await dbExecute(
+    "INSERT INTO messages_fts (rowid, content, conversation_id) VALUES (last_insert_rowid(), ?, ?)",
+    [content, convId]
+  );
+
   await dbExecute(
     "UPDATE conversations SET updated_at = ? WHERE id = ?",
     [ts, convId]
@@ -116,6 +122,13 @@ export async function loadMessages(convId: string): Promise<Array<{
     []
   );
 
+  // Create FTS5 virtual table for full-text search
+  await dbExecute(
+    `CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
+     USING fts5(content, conversation_id, content=messages, content_rowid=rowid)`,
+    []
+  );
+
   const rows = await dbSelect(
     "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY timestamp",
     [convId]
@@ -129,6 +142,43 @@ export async function loadMessages(convId: string): Promise<Array<{
 
 export async function deleteMessage(id: string): Promise<void> {
   await dbExecute("DELETE FROM messages WHERE id = ?", [id]);
+}
+
+// ── Full-Text Search ─────────────────────────────────────────────────────────
+
+export async function searchMessages(query: string, limit?: number): Promise<Array<{
+  content: string;
+  conversation_id: string;
+  timestamp: number;
+}>> {
+  if (!query.trim()) return [];
+  try {
+    // Create FTS table if not exists (idempotent)
+    await dbExecute(
+      `CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
+       USING fts5(content, conversation_id, content=messages, content_rowid=rowid)`,
+      []
+    );
+
+    const rows = await dbSelect(
+      `SELECT m.content, m.conversation_id, m.timestamp
+       FROM messages m
+       JOIN messages_fts fts ON m.rowid = fts.rowid
+       WHERE messages_fts MATCH ?
+       ORDER BY rank
+       LIMIT ?`,
+      [query, limit ?? 50]
+    );
+
+    return rows as Array<{
+      content: string;
+      conversation_id: string;
+      timestamp: number;
+    }>;
+  } catch (e) {
+    console.warn("[DB] searchMessages failed:", e);
+    return [];
+  }
 }
 
 // ── Utility functions ────────────────────────────────────────────────────────

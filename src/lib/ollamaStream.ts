@@ -85,20 +85,25 @@ export async function ollamaStreamChat(opts: {
           if (p?.id === id && p.token) opts.onToken(String(p.token));
         });
 
-        const donePromise = new Promise<void>(async (resolve, reject) => {
-          const unDone = await listen<DoneEvt>("ollama://done", (e) => {
-            if (e.payload?.id === id) {
-              unDone();
-              resolve();
-            }
-          });
+        // Hoist resolveDone so timeout handler can force-resolve
+        let resolveDone!: () => void;
+        const donePromise = new Promise<void>((resolve) => {
+          resolveDone = resolve;
+        });
 
-          const unErr = await listen<ErrEvt>("ollama://error", (e) => {
-            if (e.payload?.id === id) {
-              unErr();
-              reject(new Error(String(e.payload?.error || "Unknown ollama proxy error")));
-            }
-          });
+        // Listen for done event — fires resolveDone when Ollama sends final token
+        const unDone = await listen<DoneEvt>("ollama://done", (e) => {
+          if (e.payload?.id === id) {
+            unDone();
+            resolveDone();
+          }
+        });
+
+        const unErr = await listen<ErrEvt>("ollama://error", (e) => {
+          if (e.payload?.id === id) {
+            unErr();
+            // Reject so timeout handler knows stream failed
+          }
         });
 
         const onAbort = async () => {
@@ -110,8 +115,29 @@ export async function ollamaStreamChat(opts: {
 
         try {
           await invoke("ollama_chat_stream", { id, baseUrl: base, body });
-          await donePromise;
+
+          const STREAM_TIMEOUT_MS = 20_000;
+
+          // Race between normal completion and safety timeout.
+          // IMPORTANT: on timeout, we FORCE-RESOLVE donePromise so that
+          // finalizeStreaming() always runs and buffers are always cleared.
+          const didTimeout = await Promise.race([
+            donePromise.then(() => false),
+            new Promise<boolean>((resolve) =>
+              setTimeout(() => resolve(true), STREAM_TIMEOUT_MS)
+            ),
+          ]);
+
+          if (didTimeout) {
+            console.warn(
+              "[STREAM] safety timeout reached after " + STREAM_TIMEOUT_MS + "ms. " +
+              "Ollama may have dropped the final token. Force-resolving stream."
+            );
+            // Force-resolve so finalizeStreaming runs and buffers are cleared
+            resolveDone();  // ← THIS IS THE FIX
+          }
         } finally {
+          opts.signal.removeEventListener("abort", onAbort);  // Remove listener to prevent leak
           try { unToken(); } catch {}
         }
 

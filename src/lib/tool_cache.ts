@@ -9,6 +9,9 @@
 
 import { mcpListTools, getCachedTools as getMcpCachedTools, type McpTool } from "./mcp";
 
+// Re-export McpTool for agentic.ts
+export type { McpTool };
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export type ToolCatalog = {

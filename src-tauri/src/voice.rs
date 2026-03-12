@@ -32,10 +32,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::io::Read;
+use base64::{Engine as _, engine::general_purpose};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 struct WhisperProcess { child: Option<Child> }
 
@@ -357,4 +359,93 @@ pub async fn voice_tts_speak(app: AppHandle, text: String, speed: Option<f32>) -
 
   if bytes.len() < 44 { return Err("piper produced an empty WAV.".to_string()); }
   Ok(bytes)
+}
+
+/// Stream TTS: emits "tts-chunk" events with base64 raw PCM chunks as Piper generates.
+/// Frontend listens for events rather than awaiting a single return value.
+/// Uses --output-raw (no WAV header) for lower latency first-chunk delivery.
+#[tauri::command]
+pub async fn voice_tts_speak_stream(
+    app: AppHandle,
+    text: String,
+    speed: Option<f32>,
+) -> Result<(), String> {
+    let dir     = voice_data_dir(&app);
+    let bin     = piper_exe(&dir);
+    let mdl     = piper_model(&dir);
+    let run_dir = piper_run_dir(&dir);
+
+    if !bin.exists() {
+        return Err(format!(
+            "piper.exe not found at {}. Extract the full piper zip into voice/piper/.",
+            bin.display()
+        ));
+    }
+    if !mdl.exists() {
+        return Err(format!(
+            "Voice model not found at {}. Download en_US-lessac-medium.onnx into voice/voices/.",
+            mdl.display()
+        ));
+    }
+
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Err("TTS text is empty.".to_string());
+    }
+
+    let length_scale = format!("{:.2}", 1.0_f32 / speed.unwrap_or(1.0).max(0.1));
+
+    // --output-raw: raw 16-bit signed PCM to stdout, no WAV header
+    // This allows streaming — first bytes arrive before synthesis completes
+    let mut child = Command::new(&bin)
+        .args([
+            "--model",            mdl.to_str().unwrap_or(""),
+            "--output-raw",
+            "--sentence_silence", "0.05",
+            "--length_scale",     &length_scale,
+            "--quiet",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .current_dir(&run_dir)
+        .spawn()
+        .map_err(|e| format!(
+            "Failed to spawn piper: {}. Make sure voice/piper/ has piper.exe + all DLLs + espeak-ng-data/.",
+            e
+        ))?;
+
+    // Feed text then close stdin so piper starts synthesising
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = writeln!(stdin, "{}", text);
+        // stdin drops here, signalling EOF to piper
+    }
+
+    // Read stdout in 4KB chunks and emit each as a Tauri event
+    if let Some(stdout) = child.stdout.take() {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut buf = [0u8; 4096];
+
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break, // EOF — piper finished
+                Ok(n) => {
+                    let chunk = &buf[..n];
+                    let encoded = general_purpose::STANDARD.encode(chunk);
+                    let _ = app.emit_all("tts-chunk", encoded);
+                }
+                Err(e) => {
+                    let _ = app.emit_all("tts-error", e.to_string());
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = child.wait();
+
+    // Signal that all chunks have been emitted
+    let _ = app.emit_all("tts-done", ());
+
+    Ok(())
 }

@@ -42,7 +42,7 @@ export type VoiceSettings = {
 export function defaultVoiceSettings(): VoiceSettings {
   return {
     sttBaseUrl: "http://127.0.0.1:9900",
-    sttPath: "/asr",
+    sttPath: "/inference",
 
     sttLanguage: "",
     sttTask: "transcribe",

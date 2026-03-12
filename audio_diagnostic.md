@@ -1,0 +1,434 @@
+# Audio System Diagnostic
+
+## Score: 4/10
+
+## What Is Solid (paste exact code for each)
+- RMS-based VAD with adjustable thresholds and silence timers stops recording automatically and drives a mic-level meter. This works because it uses an `AnalyserNode` RMS loop and clamps user-tunable thresholds. `src/components/VoicePanel.tsx:211`.
+```ts
+function setupVad(stream: MediaStream) {
+  cleanupVad();
+  try {
+    const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+    audioCtxRef.current = ctx;
+    const src     = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyserRef.current = analyser;
+    src.connect(analyser);
+    const data = new Uint8Array(analyser.fftSize);
+    vadSpeechDetectedRef.current = false;
+    vadSilenceAccumRef.current   = 0;
+    vadStartedAtRef.current      = Date.now();
+    const tickMs = 100;
+    vadIntervalRef.current = window.setInterval(() => {
+      const a = analyserRef.current;
+      if (!a) return;
+      a.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
+      const rms       = Math.sqrt(sum / data.length);
+      setMicLevel(Math.min(1, rms * 12)); // scale 0-1 for display (rms ~0-0.08 in normal speech)
+      const threshold = clamp(Number(s.vadThreshold || 0.02), 0.005, 0.2);
+      const silenceMs = clamp(Number(s.vadSilenceMs  || 900),  200, 4000);
+      const minMs     = clamp(Number(s.vadMinSpeechMs || 600), 0,   5000);
+      const elapsed   = Date.now() - vadStartedAtRef.current;
+      if (rms > threshold) { vadSpeechDetectedRef.current = true; vadSilenceAccumRef.current = 0; return; }
+      if (vadSpeechDetectedRef.current && elapsed >= minMs) {
+        vadSilenceAccumRef.current += tickMs;
+        if (vadSilenceAccumRef.current >= silenceMs) stopRec().catch(() => {});
+      }
+    }, tickMs);
+  } catch {}
+}
+```
+- Whisper STT is robust to silence/noise via explicit token filtering, which prevents garbage transcripts from being sent. `src/lib/sttClient.ts:78`.
+```ts
+export async function sttTranscribe(
+  blob: Blob,
+  settings: VoiceSettings,
+): Promise<string> {
+  const base = (settings.sttBaseUrl || "http://127.0.0.1:9900").replace(/\/+$/, "");
+  const rawPath = (settings.sttPath || "/inference").trim() || "/inference";
+  const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
+  const url  = `${base}${path}`;
+  ...
+  const text = (data.text || "").trim();
+  if (!text) throw new Error("Whisper returned empty transcript. Try speaking louder or closer to mic.");
+
+  const silenceTokens = /^\[BLANK_AUDIO\]$|^\(silence\)$|^\[noise\]$|^\[Music\]$|^\[Applause\]$/i;
+  if (silenceTokens.test(text)) {
+    throw new Error("No speech detected — whisper heard only silence. Speak clearly after the ready tone.");
+  }
+
+  return text;
+}
+```
+- Piper TTS integration is solid and includes markdown stripping plus reliable playback handling and cleanup. `src/lib/ttsClient.ts:88`.
+```ts
+export async function ttsSpeak(text: string, settings: VoiceSettings): Promise<void> {
+  stopCurrentAudio();
+
+  if (!text?.trim()) return;
+
+  const cleanText = stripMarkdownForTTS(text.trim());
+
+  if (!cleanText) return;
+
+  if (isTauri && tauriInvoke) {
+    const wavBytes = await tauriInvoke<number[]>("voice_tts_speak", { text: cleanText, speed: Number(settings.ttsSpeed ?? 1.0) });
+    const blob = new Blob([new Uint8Array(wavBytes)], { type: "audio/wav" });
+    const url  = URL.createObjectURL(blob);
+
+    currentBlobUrl = url;
+    const audio    = new Audio(url);
+    currentAudio   = audio;
+
+    return new Promise<void>((resolve, reject) => {
+      audio.onended = () => {
+        stopCurrentAudio();
+        resolve();
+      };
+      audio.onerror = (e) => {
+        stopCurrentAudio();
+        reject(new Error(`Audio playback failed: ${JSON.stringify(e)}`));
+      };
+      audio.play().catch((e) => {
+        stopCurrentAudio();
+        reject(new Error(`Audio.play() failed: ${e?.message || String(e)}`));
+      });
+    });
+  }
+  ...
+}
+```
+- Web Speech API STT is configured for continuous recognition with interim results (in the unused `ConversationLoop` stack). `src/lib/voice/micSTT.ts:29`.
+```ts
+const rec: SpeechRecognition = new SR();
+
+rec.continuous = true;
+rec.interimResults = true;
+rec.lang = "en-US";
+
+rec.onresult = (e: SpeechRecognitionEvent) => {
+  let interim = "";
+  let final = "";
+
+  for (let i = e.resultIndex; i < e.results.length; i++) {
+    const txt = e.results[i][0].transcript;
+    if (e.results[i].isFinal) final += txt;
+    else interim += txt;
+  }
+
+  if (interim) this.opts.onInterim(interim);
+  if (final) this.opts.onFinal(final.trim());
+};
+```
+- Streaming sentence-level TTS is implemented (system voices via `SpeechSynthesis`) and can speak while tokens stream (unused in the UI). `src/lib/voice/streamTTS.ts:64`.
+```ts
+const utt = new SpeechSynthesisUtterance(next);
+
+utt.rate = 1.05;
+
+utt.onstart = () => {
+  this.speaking = true;
+  this.lastSpeakTime = Date.now();
+};
+
+utt.onend = () => {
+  this.speaking = false;
+  const delay = Math.max(20, 120 - (Date.now() - this.lastSpeakTime));
+  setTimeout(() => this.drain(), delay);
+};
+
+this.synth.speak(utt);
+```
+- Auto-speak and auto-listen are wired in the main app loop and will restart mic after TTS when enabled. `src/App.tsx:479`.
+```ts
+async function maybeAutoSpeakLastAssistant(chatId?: string) {
+  try {
+    const vs = loadVoiceSettings();
+    if (!vs.autoSpeak) return;
+    const all = loadChats();
+    const id = chatId || loadActiveChatId();
+    const thread = all.find((c) => c.id === id) || all[0];
+    const msg = thread?.messages
+      ?.slice().reverse()
+      .find((m) =>
+        m.role === "assistant" &&
+        (m.content || "").trim().length > 0 &&
+        !String(m.content).startsWith("__STATUS__:")
+      );
+    const text = (msg?.content || "").trim();
+    if (!text || text === lastSpokenRef.current) return;
+    lastSpokenRef.current = text;
+    await ttsSpeak(text, vs);
+    if (vs.autoListenAfterSpeak) {
+      const start = (window as any).__nikolai_voice_start;
+      if (typeof start === "function") setTimeout(() => { try { start(); } catch {} }, 250);
+    }
+  } catch { }
+}
+```
+- UI provides phase indicator and mic level meter while recording. `src/components/VoicePanel.tsx:368` and `src/components/VoicePanel.tsx:641`.
+```tsx
+const indicator =
+  phase === "ready"        ? "Ready…"        :
+  phase === "listening"    ? "Listening…"    :
+  phase === "transcribing" ? "Transcribing…" : "Idle";
+...
+<div className="text-[11px] px-2 py-1 rounded border border-white/10 bg-white/5">
+  {indicator}
+</div>
+```
+```tsx
+{recording && (
+  <div className="space-y-1">
+    <div className="flex items-center gap-2">
+      <div className="flex-1 h-2 rounded-full bg-white/10 overflow-hidden">
+        <div
+          className="h-full rounded-full transition-none"
+          style={{
+            width: `${Math.round(micLevel * 100)}%`,
+            background: micLevel > 0.75
+              ? "rgb(248 113 113)"
+              : micLevel > 0.4
+              ? "rgb(251 191 36)"
+              : "rgb(52 211 153)",
+          }}
+        />
+      </div>
+      <span className="text-[10px] opacity-40 w-6 text-right tabular-nums">
+        {Math.round(micLevel * 100)}
+      </span>
+    </div>
+    <div className="text-[10px] opacity-40">
+      {micLevel < 0.05
+        ? "No signal — check mic privacy settings"
+        : micLevel > 0.75
+        ? "Too loud — move mic further away"
+        : "Good signal ?"}
+    </div>
+  </div>
+)}
+```
+
+## What Is Broken or Missing (paste exact code showing the gap)
+- TURN MANAGEMENT: There are two separate voice stacks, and the state-machine driven `ConversationLoop` is only used in a test harness, not the app UI. That means the listen?think?speak?listen loop is not actually wired to the shipped UI. Severity: degrades experience. `src/lib/voice/testLoop.ts:36`.
+```ts
+export async function runVoiceLoopTest(model: string) {
+  const loop = new ConversationLoop({
+    onPhaseChange: (p) => {
+      console.log("[voice phase]", p);
+    },
+    ...
+    runAgent: (msg) => runAgentAsEvents(msg, { model }),
+  });
+  ...
+  await loop.injectUserMessage(
+    "Explain how the Nikolai agent architecture works."
+  );
+}
+```
+- TURN MANAGEMENT: `VoicePanel` calls `window.__nikolai_tts_last`, but it is never defined anywhere. Auto-speak after STT will silently do nothing. Severity: degrades experience. `src/components/VoicePanel.tsx:282`.
+```ts
+// autoListenAfterSpeak: if enabled, wait for TTS to finish then re-listen
+if (s.autoSpeak) {
+  const speakFn = (window as any).__nikolai_tts_last;
+  if (typeof speakFn === "function") {
+    try {
+      setStatus("Speaking…");
+      await speakFn();
+      setStatus("Done speaking.");
+    } catch { /* ignore TTS errors — don't break the loop */ }
+  }
+}
+```
+- STT: Default settings point to `/asr`, but the STT client and UI expect `/inference`. This breaks STT out of the box unless the user manually changes settings. Severity: blocks conversation. `src/lib/voiceSettings.ts:42` and `src/lib/sttClient.ts:78`.
+```ts
+export function defaultVoiceSettings(): VoiceSettings {
+  return {
+    sttBaseUrl: "http://127.0.0.1:9900",
+    sttPath: "/asr",
+    ...
+  };
+}
+```
+```ts
+const rawPath = (settings.sttPath || "/inference").trim() || "/inference";
+```
+- TOOL AWARENESS: Tool events exist in the voice types but are never emitted; `onToolCall` only logs. No spoken announcements and no phase updates during tool execution. Severity: degrades experience. `src/lib/voice/types.ts:1` and `src/lib/voice/agentAdapter.ts:13`.
+```ts
+export type AgentEvent =
+  | { type: "token"; text: string }
+  | { type: "tool_start"; name: string; args: unknown }
+  | { type: "tool_done"; name: string; result: unknown }
+  | { type: "final"; fullText: string }
+  | { type: "error"; message: string };
+```
+```ts
+await agenticStreamChat({
+  ...
+  onToolCall: (name: string, args: unknown) => {
+    console.log("[voice tool]", name);
+  },
+});
+```
+- BARGE-IN: A hotkey handler exists but is never attached in the UI, so barge-in is effectively disabled. Severity: degrades experience. `src/lib/voice/voiceHotkeys.ts:2`.
+```ts
+export function attachVoiceHotkeys(loop: any) {
+  document.addEventListener("keydown", (e) => {
+    if (e.code === "Space") {
+      loop.handleBargeIn();
+    }
+  });
+}
+```
+- BARGE-IN: The actual barge-in implementation cancels agent + TTS but is not wired to VoicePanel or App. Severity: degrades experience. `src/lib/voice/ConversationLoop.ts:139`.
+```ts
+public handleBargeIn() {
+  this.interrupt.cancel();
+  this.tts.stop();
+  this.accumulated = "";
+  this.setPhase("interrupted");
+
+  setTimeout(() => {
+    this.setPhase("listening");
+  }, 200);
+}
+```
+- ERROR RECOVERY: STT error handling is terminal for the turn; no auto-reopen occurs. Severity: degrades experience. `src/components/VoicePanel.tsx:262` and `src/lib/voice/micSTT.ts:49`.
+```ts
+rec.onstop = async () => {
+  try {
+    ...
+  } catch (e: any) {
+    setPhase("idle"); setStatus(e?.message || String(e));
+  }
+};
+```
+```ts
+rec.onerror = (e: SpeechRecognitionErrorEvent) => {
+  this.opts.onError?.(new Error(e.error));
+};
+```
+- OLLAMA HEALTH: `ollamaHealth` exists but is not referenced anywhere in the voice system. Voice does not adapt to model health. Severity: minor. `src/lib/ollamaHealth.ts:1`.
+```ts
+export const ollamaHealth = new OllamaHealthMonitor();
+```
+
+## The Conversation Loop  Does It Exist?
+VoicePanel/App loop (actual UI path):
+1. User speaks — EXISTS. MediaRecorder starts on `startRec()`. `src/components/VoicePanel.tsx:247`.
+```ts
+const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+...
+const rec = new MediaRecorder(stream);
+...
+rec.start();
+setRecording(true);
+setPhase("listening");
+```
+2. Silence — PARTIAL. VAD auto-stop exists when enabled; otherwise user must click Stop. `src/components/VoicePanel.tsx:211` and `src/components/VoicePanel.tsx:303`.
+3. Agent runs — PARTIAL. Auto-send uses `window.__nikolai_send` but is optional; otherwise user must click send. `src/components/VoicePanel.tsx:273`.
+```ts
+if (s.autoSend) {
+  const fn = (window as any).__nikolai_send;
+  if (typeof fn === "function") { fn(text); setPhase("idle"); setStatus("Transcript auto-sent."); return; }
+  ...
+}
+```
+4. Tools — PARTIAL. Tools can run via agentic, but voice has no tool-aware events or spoken announcements. `src/lib/voice/agentAdapter.ts:13`.
+5. Response spoken — EXISTS via App auto-speak if enabled, but not tied to VoicePanel’s `autoSpeak` toggle because `__nikolai_tts_last` is missing. `src/App.tsx:479` and `src/components/VoicePanel.tsx:282`.
+6. Back to listening — EXISTS if `autoListenAfterSpeak` is enabled in App; VoicePanel also schedules `startRec()` after speak. `src/App.tsx:497` and `src/components/VoicePanel.tsx:293`.
+
+ConversationLoop (state-machine loop, currently unused in UI):
+1. User speaks — EXISTS via Web Speech API in `MicSTT`. `src/lib/voice/micSTT.ts:19`.
+2. Silence — EXISTS via fixed 1200ms timer on final transcript. `src/lib/voice/ConversationLoop.ts:56`.
+3. Agent runs — EXISTS via `runAgent` generator. `src/lib/voice/ConversationLoop.ts:88`.
+4. Tools — MISSING. Tool events are defined but not emitted. `src/lib/voice/types.ts:1`.
+5. Response spoken — EXISTS via streaming `SpeechSynthesis`. `src/lib/voice/ConversationLoop.ts:103` and `src/lib/voice/streamTTS.ts:64`.
+6. Back to listening — EXISTS on `final` event. `src/lib/voice/ConversationLoop.ts:113`.
+
+## Top 5 Fixes in Order
+1. Fix STT default path mismatch.
+File: `src/lib/voiceSettings.ts:44` (change this line)
+Add or replace with:
+```ts
+sttPath: "/inference",
+```
+2. Define the missing `__nikolai_tts_last` hook so VoicePanel auto-speak works.
+File: `src/App.tsx` add after `maybeAutoSpeakLastAssistant` (after line 502).
+Add:
+```ts
+useEffect(() => {
+  (window as any).__nikolai_tts_last = async () => {
+    const vs = loadVoiceSettings();
+    const all = loadChats();
+    const id = loadActiveChatId();
+    const thread = all.find((c) => c.id === id) || all[0];
+    const msg = thread?.messages
+      ?.slice().reverse()
+      .find((m) =>
+        m.role === "assistant" &&
+        (m.content || "").trim().length > 0 &&
+        !String(m.content).startsWith("__STATUS__:")
+      );
+    const text = (msg?.content || "").trim();
+    if (!text) return;
+    await ttsSpeak(text, vs);
+  };
+
+  return () => { delete (window as any).__nikolai_tts_last; };
+}, []);
+```
+3. Emit tool events in the voice agent adapter so tool awareness can be announced.
+File: `src/lib/voice/agentAdapter.ts` add after line 11 and modify the event loop.
+Add:
+```ts
+const events: AgentEvent[] = [];
+```
+Replace `onToolCall` with:
+```ts
+onToolCall: (name: string, args: unknown) => {
+  events.push({ type: "tool_start", name, args });
+},
+```
+Replace the token drain loop with:
+```ts
+while (queue.length > 0 || events.length > 0) {
+  const ev = events.shift();
+  if (ev) { yield ev; continue; }
+
+  const token = queue.shift()!;
+  fullText += token;
+  yield { type: "token", text: token };
+}
+```
+4. Expose a global interrupt hook and use it to barge-in (stop agent + TTS) when recording starts.
+File: `src/App.tsx` add near the existing `__nikolai_send` hook (after line 586).
+Add:
+```ts
+useEffect(() => {
+  (window as any).__nikolai_interrupt = () => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setIsStreaming(false);
+    setAgentStatus("");
+  };
+  return () => { delete (window as any).__nikolai_interrupt; };
+}, []);
+```
+File: `src/components/VoicePanel.tsx` add after line 248 inside `startRec()`.
+Add:
+```ts
+const interrupt = (window as any).__nikolai_interrupt;
+if (typeof interrupt === "function") interrupt();
+```
+5. Auto-reopen mic after STT errors when `autoListenAfterSpeak` is enabled.
+File: `src/components/VoicePanel.tsx:296` add inside the catch block.
+Add:
+```ts
+if (s.autoListenAfterSpeak) {
+  setTimeout(() => startRec().catch(() => {}), 500);
+}
+```

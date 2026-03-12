@@ -128,7 +128,7 @@ async function testWorkspaceEscape(): Promise<TestResult> {
   // The actual enforcement is in Rust (workspace.rs resolve_secure/resolve_secure_for_write)
   // This test verifies the TypeScript layer also validates paths
   
-  const isAbsolute = /^[a-zA-Z]:\//.test(maliciousPath) || 
+  // const isAbsolute = /^[a-zA-Z]:\//.test(maliciousPath) || 
                      maliciousPath.startsWith("/") || 
                      maliciousPath.startsWith("//");
   

@@ -73,6 +73,7 @@ fn main() {
         voice::voice_start_servers,
         voice::voice_stop_servers,
         voice::voice_tts_speak,
+        voice::voice_tts_speak_stream,
 
         // -------------------------
         // Workspace

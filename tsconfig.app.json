@@ -5,7 +5,7 @@
     "useDefineForClassFields": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "ESNext",
-    "types": ["vite/client"],
+    "types": ["vite/client", "dom-speech-recognition"],
     "skipLibCheck": true,
 
     /* Bundler mode */
@@ -24,5 +24,16 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": [
+    "node_modules",
+    "src/lib/voice/ConversationLoop.ts",
+    "src/lib/voice/micSTT.ts",
+    "src/lib/voice/agentAdapter.ts",
+    "src/lib/voice/streamTTS.ts",
+    "src/lib/voice/testLoop.ts",
+    "src/lib/voice/voiceHotkeys.ts",
+    "src/lib/voice/turnStateMachine.ts",
+    "src/lib/voice/interruptController.ts"
+  ]
 }

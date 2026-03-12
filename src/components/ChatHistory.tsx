@@ -1,4 +1,4 @@
-﻿import { useMemo, useState } from "react";
+﻿import { useMemo, useState, useEffect } from "react";
 import type { ChatThread } from "../types";
 
 type Props = {
@@ -64,18 +64,25 @@ export default function ChatHistory({
   onRename,
 }: Props) {
   const [q, setQ] = useState("");
+  const [debouncedQ, setDebouncedQ] = useState("");
+
+  // Debounce search input by 250ms
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedQ(q), 250);
+    return () => clearTimeout(timer);
+  }, [q]);
 
   // When searching: flat list with snippets
   // When not searching: grouped by date
   const filtered = useMemo(() => {
-    const s = q.trim().toLowerCase();
+    const s = debouncedQ.trim().toLowerCase();
     if (!s) return chats;
     return chats.filter(
       (c) =>
         (c.title || "").toLowerCase().includes(s) ||
         (c.messages || []).some((m) => (m.content || "").toLowerCase().includes(s))
     );
-  }, [q, chats]);
+  }, [debouncedQ, chats]);
 
   const grouped = useMemo((): Array<{ label: Group; items: ChatThread[] }> => {
     if (q.trim()) return []; // don't group during search

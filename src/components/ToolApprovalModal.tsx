@@ -1,4 +1,4 @@
-﻿import { useState } from "react";
+﻿import { useState, useEffect } from "react";
 
 type Props = {
   open: boolean;
@@ -35,6 +35,18 @@ export default function ToolApprovalModal({
 }: Props) {
   const [argsExpanded, setArgsExpanded] = useState(false);
 
+  // Close modal on Escape key
+  useEffect(() => {
+    if (!open) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onDeny();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [open, onDeny]);
+
   if (!open) return null;
 
   const server = serverFromTool(toolName);
@@ -42,7 +54,12 @@ export default function ToolApprovalModal({
   const hasArgs = toolArgs && Object.keys(toolArgs).length > 0;
 
   return (
-    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="tool-approval-title"
+      className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+    >
       <div className="w-full max-w-lg rounded-2xl bg-[#0e1117] border border-white/10 shadow-2xl overflow-hidden">
 
         {/* ── Tool call header ── */}
@@ -99,7 +116,7 @@ export default function ToolApprovalModal({
 
         {/* ── Permission card body ── */}
         <div className="px-5 py-5">
-          <div className="text-[14px] font-semibold text-white/90 mb-1.5">
+          <div id="tool-approval-title" className="text-[14px] font-semibold text-white/90 mb-1.5">
             Allow{" "}
             <span className="font-mono text-[13px] bg-white/8 border border-white/10 rounded px-1.5 py-0.5 text-white/80">
               {bareName}

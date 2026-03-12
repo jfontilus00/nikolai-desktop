@@ -1,7 +1,7 @@
 ﻿import { invoke } from "@tauri-apps/api/tauri";
 import { ollamaChat, type OllamaMsg } from "./ollamaChat";
 import { ollamaStreamChat } from "./ollamaStream";
-import { getCachedTools as getToolCatalog, type McpTool } from "./tool_cache";
+import { getCachedTools as getToolCatalog, getCachedTools, type McpTool } from "./tool_cache";
 import { appendToolLog } from "./toolLog";
 import { formatToolResult } from "./toolResult";
 import { loadMemory, formatMemoryForPrompt, addFact } from "./memory";
@@ -62,6 +62,32 @@ function getToolCacheKey(name: string, args: any): string {
   } catch {
     // Fallback for non-serializable args
     return `${name}:${String(args)}`;
+  }
+}
+
+// Clear cache after any write/destructive operation
+// so subsequent reads see fresh filesystem state
+function invalidateToolCacheOnWrite(toolName: string): void {
+  const writingTools = [
+    "fs.write_file",
+    "fs.edit_file",
+    "fs.delete_file",
+    "fs.move_file",
+    "fs.rename_file",
+    "fs.copy_file",
+    "fs.create_directory",
+    "batch_commit",
+    "ws_write_text",
+    "ws_delete",
+  ];
+
+  const isWrite = writingTools.some(
+    (w) => toolName === w || toolName.endsWith(`.${w.split(".")[1]}`)
+  );
+
+  if (isWrite) {
+    toolResultCache.clear();
+    console.log(`[CACHE] cleared after write tool: ${toolName}`);
   }
 }
 
@@ -732,7 +758,7 @@ export function parsePlan(raw: string): Plan | null {
 // Validates that a parsed plan is structurally valid before execution.
 // This catches malformed or incomplete plans before wasting tool budget.
 
-async function verifyPlan(plan: Plan, userGoal: string): Promise<{ valid: boolean; reason: string }> {
+async function verifyPlan(plan: Plan, _userGoal: string): Promise<{ valid: boolean; reason: string }> {
   // Serialize plan for inspection
   const planText = JSON.stringify(plan);
 
@@ -896,7 +922,7 @@ type AgentRunState = {
   lastToolArgs: any | null;
   lastToolOk: boolean | null;
   timestamp: number;
-  status: "running" | "completed" | "failed";
+  status: "running" | "completed" | "failed" | "interrupted";
 };
 
 const AGENT_RUN_STORAGE_KEY = "nikolai.agent.run.v1";
@@ -981,6 +1007,9 @@ export async function agenticStreamChat(opts: {
   // Optional: unique run ID for persistence (auto-generated if not provided)
   runId?: string;
 }): Promise<void> {
+  // Clear trace from previous run
+  executionTrace.length = 0;
+
   const maxSteps = opts.maxSteps ?? 10;
   const runId = opts.runId || `run-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
 
@@ -1433,7 +1462,7 @@ export async function agenticStreamChat(opts: {
     const MAX_LLM_RETRIES = 3;
     const backoffDelays = [0, 1000, 3000]; // attempt 1 → immediate, 2 → 1s, 3 → 3s
 
-    let planText: string;
+    let planText: string = "";
     let lastLlmError: any = null;
 
     for (let llmAttempt = 1; llmAttempt <= MAX_LLM_RETRIES; llmAttempt++) {
@@ -1492,7 +1521,7 @@ export async function agenticStreamChat(opts: {
       convo.push({
         role: "user",
         content:
-          `Your previous response was not valid JSON:\n${planText.slice(0, 300)}\n\n` +
+          `Your previous response was not valid JSON:\n${(planText || "(empty response)").slice(0, 300)}\n\n` +
           `Respond with ONLY a JSON object. No other text. Try again.`,
       });
       step--;
@@ -1554,9 +1583,9 @@ export async function agenticStreamChat(opts: {
       opts.onStatus?.("🔄 Tool not found — refreshing hub…");
       try {
         await semanticExecutor("hub.refresh", {});
-        const refreshed = getCachedTools();
-        if (refreshed.length > 0) {
-          tools = refreshed;
+        const refreshed = await getCachedTools();
+        if (refreshed.tools.length > 0) {
+          tools = refreshed.tools;
           aliasMap = buildToolAliasMap(tools);
         }
       } catch { /* best-effort */ }
@@ -1749,10 +1778,11 @@ export async function agenticStreamChat(opts: {
         onStatus: opts.onStatus,
         signal:   opts.signal,
       });
-      
+
       // Cache the result (only if successful)
       if (result.ok) {
         toolResultCache.set(cacheKey, result);
+        invalidateToolCacheOnWrite(toolName); // clear cache if this was a write
       }
     }
 
@@ -1796,9 +1826,9 @@ export async function agenticStreamChat(opts: {
     }
 
     if (toolName === "hub.refresh" && result.ok) {
-      const refreshed = getCachedTools();
-      if (refreshed.length > 0) {
-        tools = refreshed;
+      const refreshed = await getCachedTools();
+      if (refreshed.tools.length > 0) {
+        tools = refreshed.tools;
         aliasMap = buildToolAliasMap(tools);
       }
     }
@@ -1875,6 +1905,9 @@ export async function agenticStreamChat(opts: {
 
     if (commitResult.ok) {
       const { batch_id, applied } = commitResult.result;
+
+      // Clear cache after batch commit so subsequent reads see fresh state
+      invalidateToolCacheOnWrite("batch_commit");
 
       // ── Verify each file was actually written ─────────────────────────────
       let verifyError: string | null = null;

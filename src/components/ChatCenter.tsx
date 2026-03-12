@@ -15,7 +15,8 @@ if (isTauri) {
 }
 
 // ── Syntax highlighting with Shiki ────────────────────────────────────────────
-let highlighter: Highlighter | null = null;
+// Syntax highlighting with Shiki disabled — unused variable removed
+// let highlighter: Highlighter | null = null;
 let highlighterPromise: Promise<Highlighter> | null = null;
 
 async function getHighlighter() {
@@ -23,7 +24,7 @@ async function getHighlighter() {
     highlighterPromise = createHighlighter({
       themes: ["github-dark"],
       langs: ["typescript", "javascript", "python", "rust", "bash", "json", "tsx", "jsx", "css", "html", "sql", "markdown"]
-    }).then(hl => { highlighter = hl; return hl; });
+    }).then(hl => { return hl; });
   }
   return highlighterPromise;
 }
@@ -42,6 +43,7 @@ type Props = {
   chat: ChatThread | null;
   onSend: (text: string, images?: string[]) => void;
   isStreaming: boolean;
+  isThinking?: boolean;
   onStop: () => void;
   onRegenerate?: () => void;
   canRegenerate?: boolean;
@@ -290,10 +292,12 @@ function CodeBlock({ code, lang }: { code: string; lang?: string }) {
         onClick={async () => {
           if (await copyText(code)) { setCopied(true); setTimeout(() => setCopied(false), 1200); }
         }}
+        aria-label="Copy code to clipboard"
+        title="Copy code to clipboard"
       >
         {copied ? "✓ Copied" : "Copy"}
       </button>
-      <div 
+      <div
         className="text-xs overflow-x-auto rounded-lg bg-black/40 border border-white/10"
         dangerouslySetInnerHTML={{ __html: html }}
       />
@@ -437,6 +441,8 @@ function ToolStepCard({ step }: { step: ActionStep }) {
                       setTimeout(() => setCopied(false), 1200);
                     }
                   }}
+                  aria-label="Copy file content to clipboard"
+                  title="Copy file content"
                 >
                   {copied ? "Copied!" : "Copy"}
                 </button>
@@ -516,6 +522,7 @@ export default function ChatCenter({
   chat,
   onSend,
   isStreaming,
+  isThinking,
   onStop,
   onRegenerate,
   canRegenerate,
@@ -818,6 +825,16 @@ export default function ChatCenter({
             onRegenerate={onRegenerate}
           />
         ))}
+        {isThinking && (
+          <div className="flex items-center gap-2 px-2 py-3 text-white/40 text-sm">
+            <span className="inline-flex gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-white/40 animate-bounce [animation-delay:0ms]" />
+              <span className="w-1.5 h-1.5 rounded-full bg-white/40 animate-bounce [animation-delay:150ms]" />
+              <span className="w-1.5 h-1.5 rounded-full bg-white/40 animate-bounce [animation-delay:300ms]" />
+            </span>
+            <span>NikolAI is thinking…</span>
+          </div>
+        )}
         <div ref={endRef} />
         {showJumpToBottom && (
           <button
@@ -1110,6 +1127,8 @@ function MessageBubble({
             <button
               className="text-[11px] px-2 py-1 rounded bg-white/10 hover:bg-white/15 border border-white/10"
               onClick={() => copyText(content)}
+              aria-label="Copy message to clipboard"
+              title="Copy message"
             >
               Copy
             </button>
@@ -1117,6 +1136,8 @@ function MessageBubble({
               <button
                 className="text-[11px] px-2 py-1 rounded bg-white/10 hover:bg-white/15 border border-white/10"
                 onClick={onRegenerate}
+                aria-label="Regenerate response"
+                title="Regenerate response"
               >
                 Regen
               </button>

@@ -34,5 +34,8 @@ tokio-util = "0.7"
 # SQLite database (direct rusqlite for Tauri v1)
 rusqlite = { version = "0.29", features = ["bundled"] }
 
+# Base64 encoding for streaming TTS chunks
+base64 = "0.21"
+
 [features]
 custom-protocol = ["tauri/custom-protocol"]
