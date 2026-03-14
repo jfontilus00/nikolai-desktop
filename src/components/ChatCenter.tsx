@@ -688,6 +688,7 @@ export default function ChatCenter({
   };
 
   if (!chat) {
+    console.log("[CHATCENTER] chat is null - showing empty state");
     return <div className="h-full flex items-center justify-center text-sm opacity-70">Create a chat from the left panel.</div>;
   }
 
@@ -816,6 +817,7 @@ export default function ChatCenter({
         onScroll={onScroll}
         className="flex-1 overflow-auto p-4 space-y-6 relative"
       >
+        {console.log("[CHATCENTER] rendering messages", { chatId: chat?.id, messageCount: chat?.messages?.length || 0 })}
         {chat.messages.map((m, idx) => (
           <MessageBubble
             key={m.id}

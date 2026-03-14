@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { loadVoiceSettings, saveVoiceSettings, type VoiceSettings } from "../lib/voiceSettings";
 import { sttTranscribe, sttPing } from "../lib/sttClient";
 import { ttsSpeak, ttsStop, stopTTS } from "../lib/ttsClient";
-import { loadChats, loadActiveChatId } from "../lib/storage";
+import type { ChatThread } from "../types";
 
 // Tauri invoke guard
 const isTauri = typeof window !== "undefined" && !!(window as any).__TAURI__;
@@ -13,6 +13,8 @@ if (isTauri) {
 
 type Props = {
   onInsertToComposer?: (text: string) => void;
+  chats: ChatThread[];
+  activeId: string | null;
 };
 
 type Phase = "idle" | "ready" | "listening" | "transcribing";
@@ -104,7 +106,7 @@ function StatusDot({ ok }: { ok: boolean }) {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export default function VoicePanel({ onInsertToComposer }: Props) {
+export default function VoicePanel({ onInsertToComposer, chats, activeId }: Props) {
   const [s, setS] = useState<VoiceSettings>(() => loadVoiceSettings());
   const [status, setStatus] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
@@ -774,8 +776,6 @@ export default function VoicePanel({ onInsertToComposer }: Props) {
           <button type="button" className="px-3 py-2 rounded-md bg-blue-600 hover:bg-blue-500 text-sm font-semibold"
             onClick={async () => {
               try {
-                const chats    = loadChats();
-                const activeId = loadActiveChatId();
                 const thread   = chats.find((c) => c.id === activeId) || chats[0];
                 const msg      = thread?.messages?.slice().reverse().find((m) => m.role === "assistant" && (m.content || "").trim().length > 0);
                 const text     = msg?.content || "";

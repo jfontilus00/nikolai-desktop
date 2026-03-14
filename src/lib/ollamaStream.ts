@@ -4,6 +4,19 @@ import type { OllamaMsg } from "./ollamaChat";
 import { ollamaHealth } from "./ollamaHealth";
 import { llmQueue } from "./llmQueue";
 
+/**
+ * Thrown when the safety timeout fires and Ollama has not
+ * produced a complete response. Named class so it can be
+ * caught specifically in the parse retry loop without
+ * being confused with real LLM errors.
+ */
+export class StreamTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StreamTimeoutError";
+  }
+}
+
 // ── Timeout Helper ────────────────────────────────────────────────────────────
 // Wraps a promise with a timeout to prevent hanging requests.
 
@@ -28,7 +41,7 @@ function norm(baseUrl: string) {
 }
 
 type TokenEvt = { id: string; token: string };
-type DoneEvt  = { id: string; aborted: boolean };
+type DoneEvt  = { id: string; aborted: boolean; prompt_tokens?: number; output_tokens?: number };
 type ErrEvt   = { id: string; error: string };
 
 // ── V3: OllamaMsg extended to carry images ─────────────────────────────────
@@ -45,9 +58,15 @@ export async function ollamaStreamChat(opts: {
   messages: OllamaMsgWithImages[];
   signal: AbortSignal;
   onToken: (t: string) => void;
-}): Promise<void> {
+}): Promise<{ promptTokens: number; completionTokens: number }> {
   const base = norm(opts.baseUrl);
   if (!base) throw new Error("Ollama base URL is empty.");
+
+  console.log("[OLLAMA] stream chat start", {
+    baseUrl: base,
+    model: opts.model,
+    messageCount: opts.messages.length
+  });
 
   // Strip images from non-last messages to keep context small.
   // Ollama only uses images on the current turn anyway.
@@ -80,22 +99,32 @@ export async function ollamaStreamChat(opts: {
       if (isTauri()) {
         const id = `ol-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
+        console.log("[OLLAMA] Tauri stream start", { id, baseUrl: base });
+
         const unToken = await listen<TokenEvt>("ollama://token", (e) => {
           const p = e.payload;
-          if (p?.id === id && p.token) opts.onToken(String(p.token));
+          if (p?.id === id && p.token) {
+            console.log("[OLLAMA] token received", p.token.slice(0, 50));
+            opts.onToken(String(p.token));
+          }
         });
 
         // Hoist resolveDone so timeout handler can force-resolve
-        let resolveDone!: () => void;
-        const donePromise = new Promise<void>((resolve) => {
+        let resolveDone!: (promptTokens?: number, outputTokens?: number) => void;
+        const donePromise = new Promise<{ promptTokens?: number; outputTokens?: number } | void>((resolve) => {
           resolveDone = resolve;
         });
 
         // Listen for done event — fires resolveDone when Ollama sends final token
         const unDone = await listen<DoneEvt>("ollama://done", (e) => {
           if (e.payload?.id === id) {
+            console.log("[OLLAMA] done event received", {
+              id,
+              prompt_tokens: e.payload.prompt_tokens,
+              output_tokens: e.payload.output_tokens
+            });
             unDone();
-            resolveDone();
+            resolveDone(e.payload.prompt_tokens, e.payload.output_tokens);
           }
         });
 
@@ -121,27 +150,45 @@ export async function ollamaStreamChat(opts: {
           // Race between normal completion and safety timeout.
           // IMPORTANT: on timeout, we FORCE-RESOLVE donePromise so that
           // finalizeStreaming() always runs and buffers are always cleared.
-          const didTimeout = await Promise.race([
-            donePromise.then(() => false),
-            new Promise<boolean>((resolve) =>
-              setTimeout(() => resolve(true), STREAM_TIMEOUT_MS)
+          const tokenResult = await Promise.race([
+            donePromise,
+            new Promise<undefined>((resolve) =>
+              setTimeout(() => resolve(undefined), STREAM_TIMEOUT_MS)
             ),
           ]);
 
-          if (didTimeout) {
+          if (tokenResult === undefined) {
             console.warn(
               "[STREAM] safety timeout reached after " + STREAM_TIMEOUT_MS + "ms. " +
               "Ollama may have dropped the final token. Force-resolving stream."
             );
             // Force-resolve so finalizeStreaming runs and buffers are cleared
             resolveDone();  // ← THIS IS THE FIX
+
+            // Throw named error so parse retry loop can identify timeout
+            // vs genuine JSON parse failure and exit immediately.
+            throw new StreamTimeoutError(
+              "Ollama stream timed out after " + STREAM_TIMEOUT_MS + "ms"
+            );
           }
+
+          // Log token counts if available from Ollama
+          if (tokenResult && tokenResult.prompt_tokens !== undefined) {
+            console.log(
+              `[OLLAMA] tokens: prompt=${tokenResult.prompt_tokens}, output=${tokenResult.output_tokens}`
+            );
+            return {
+              promptTokens: tokenResult.prompt_tokens,
+              completionTokens: tokenResult.output_tokens,
+            };
+          }
+
+          // Fallback: no token data available
+          return { promptTokens: 0, completionTokens: 0 };
         } finally {
           opts.signal.removeEventListener("abort", onAbort);  // Remove listener to prevent leak
           try { unToken(); } catch {}
         }
-
-        return;
       }
 
       // Browser fallback: direct fetch streaming (NDJSON)
@@ -163,9 +210,24 @@ export async function ollamaStreamChat(opts: {
       const dec = new TextDecoder();
       let buf = "";
 
+      // Track last known token counts for fallback when stream closes without done marker
+      let lastKnownPromptTokens = 0;
+      let lastKnownOutputTokens = 0;
+      let receivedDoneMarker = false;
+
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        
+        // Stream closed — return last known token counts if no done marker received
+        if (done) {
+          if (!receivedDoneMarker) {
+            console.warn("[OLLAMA] stream closed without done marker");
+          }
+          return {
+            promptTokens: lastKnownPromptTokens,
+            completionTokens: lastKnownOutputTokens
+          };
+        }
 
         buf += dec.decode(value, { stream: true });
 
@@ -178,7 +240,15 @@ export async function ollamaStreamChat(opts: {
             const j: any = JSON.parse(line);
             const token = j?.message?.content ?? j?.response ?? "";
             if (token) opts.onToken(String(token));
-            if (j?.done) return;
+            if (j?.done) {
+              receivedDoneMarker = true;
+              lastKnownPromptTokens = j?.prompt_eval_count ?? 0;
+              lastKnownOutputTokens = j?.eval_count ?? 0;
+              console.log(
+                `[OLLAMA] tokens: prompt=${lastKnownPromptTokens}, output=${lastKnownOutputTokens}`
+              );
+              return { promptTokens: lastKnownPromptTokens, completionTokens: lastKnownOutputTokens };
+            }
           } catch { /* ignore parse errors */ }
         }
       }

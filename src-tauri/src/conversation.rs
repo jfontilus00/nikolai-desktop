@@ -116,12 +116,12 @@ pub fn message_list(
     let rows = crate::db::load_messages(conn, &conversation_id)?;
     let messages = rows
       .into_iter()
-      .map(|(role, content)| Message {
-        id: String::new(),
+      .map(|(id, role, content, timestamp)| Message {
+        id,
         conversation_id: conversation_id.clone(),
         role,
         content,
-        created_at: 0,
+        created_at: timestamp,
       })
       .collect();
     Ok(messages)

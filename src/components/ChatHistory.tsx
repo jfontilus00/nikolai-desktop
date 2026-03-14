@@ -9,6 +9,7 @@ type Props = {
   onCreate: () => void;
   onDelete: (id: string) => void;
   onRename: (id: string, title: string) => void;
+  loading?: boolean;
 };
 
 // ── Date grouping ─────────────────────────────────────────────────────────────
@@ -62,6 +63,7 @@ export default function ChatHistory({
   onCreate,
   onDelete,
   onRename,
+  loading,
 }: Props) {
   const [q, setQ] = useState("");
   const [debouncedQ, setDebouncedQ] = useState("");
@@ -97,6 +99,15 @@ export default function ChatHistory({
       .map((g) => ({ label: g, items: map.get(g)! }))
       .filter((g) => g.items.length > 0);
   }, [q, chats]);
+
+  // Show loading state (after hooks to maintain hook order)
+  if (loading) {
+    return (
+      <div className="p-4 text-white/40 text-sm">
+        Loading chats...
+      </div>
+    );
+  }
 
   // ── Collapsed sidebar ──────────────────────────────────────────────────────
 

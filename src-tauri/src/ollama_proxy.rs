@@ -22,6 +22,8 @@ struct TokenPayload {
 struct DonePayload {
   id: String,
   aborted: bool,
+  prompt_tokens: u64,
+  output_tokens: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -111,8 +113,8 @@ pub async fn ollama_chat_stream(
   let window2 = window.clone();
 
   tokio::spawn(async move {
-    let do_emit_done = |aborted: bool| {
-      let _ = window2.emit(EVT_DONE, DonePayload { id: id.clone(), aborted });
+    let do_emit_done = |aborted: bool, prompt_tokens: u64, output_tokens: u64| {
+      let _ = window2.emit(EVT_DONE, DonePayload { id: id.clone(), aborted, prompt_tokens, output_tokens });
     };
 
     let do_emit_err = |msg: String| {
@@ -127,7 +129,7 @@ pub async fn ollama_chat_stream(
       Ok(r) => r,
       Err(e) => {
         do_emit_err(format!("request failed: {}", e));
-        do_emit_done(false);
+        do_emit_done(false, 0, 0);
         jobs().lock().unwrap().remove(&id);
         return;
       }
@@ -137,7 +139,7 @@ pub async fn ollama_chat_stream(
     if !status.is_success() {
       let text = resp.text().await.unwrap_or_else(|_| "".to_string());
       do_emit_err(format!("ollama error ({}): {}", status, text));
-      do_emit_done(false);
+      do_emit_done(false, 0, 0);
       jobs().lock().unwrap().remove(&id);
       return;
     }
@@ -189,7 +191,9 @@ pub async fn ollama_chat_stream(
 
             let done = v.get("done").and_then(|x| x.as_bool()).unwrap_or(false);
             if done {
-              do_emit_done(aborted);
+              let prompt_tokens = v.get("prompt_eval_count").and_then(|x| x.as_u64()).unwrap_or(0);
+              let output_tokens = v.get("eval_count").and_then(|x| x.as_u64()).unwrap_or(0);
+              do_emit_done(aborted, prompt_tokens, output_tokens);
               jobs().lock().unwrap().remove(&id);
               return;
             }
@@ -207,7 +211,7 @@ pub async fn ollama_chat_stream(
       }
     }
 
-    do_emit_done(aborted);
+    do_emit_done(aborted, 0, 0);
     jobs().lock().unwrap().remove(&id);
   });
 

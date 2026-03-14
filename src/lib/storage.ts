@@ -115,7 +115,7 @@ export type ProviderProfile = {
 
 function sanitizeProvider(p: ProviderConfig): ProviderConfig {
   const anyP: any = p || {};
-  const kind = (anyP.kind || "ollama") as any;
+  const kind = anyP.kind as any;
 
   // never persist apiKey
   const { apiKey: _drop, ...rest } = anyP;

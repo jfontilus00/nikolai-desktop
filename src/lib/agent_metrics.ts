@@ -7,11 +7,14 @@
 // Does NOT modify agent logic or security behavior.
 //
 
+import { logUsage } from "./usageLog";
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface AgentMetrics {
   runId: string;
   startTime: number;
+  model?: string;
   endTime?: number;
   stepsExecuted: number;
   toolsUsed: Record<string, number>;
@@ -32,10 +35,11 @@ let currentMetrics: AgentMetrics | null = null;
 /**
  * Starts metrics tracking for a new agent run.
  */
-export function startAgentMetrics(runId: string): void {
+export function startAgentMetrics(runId: string, model?: string): void {
   currentMetrics = {
     runId,
     startTime: Date.now(),
+    model: model ?? "",
     stepsExecuted: 0,
     toolsUsed: {},
     lowConfidenceTools: [],
@@ -76,13 +80,30 @@ export function recordError(error: string): void {
  */
 export function finishAgentMetrics(): void {
   if (!currentMetrics) return;
-  
+
   currentMetrics.endTime = Date.now();
   currentMetrics.status = currentMetrics.status === "running" ? "completed" : currentMetrics.status;
-  
+
   // Log metrics to console
   logMetrics(currentMetrics);
-  
+
+  // Persist usage before clearing metrics
+  try {
+    const toolCalls = Object.values(currentMetrics.toolsUsed).reduce((sum, count) => sum + count, 0);
+    logUsage({
+      timestamp: Date.now(),
+      runId: currentMetrics.runId,
+      type: "agent",
+      model: currentMetrics.model ?? "",
+      toolCalls,
+      durationMs: currentMetrics.endTime
+        ? currentMetrics.endTime - currentMetrics.startTime
+        : 0,
+    });
+  } catch (err) {
+    console.warn("[usageLog] failed to record agent usage", err);
+  }
+
   // Clear current metrics
   currentMetrics = null;
 }

@@ -114,8 +114,10 @@ export async function saveMessage(
 }
 
 export async function loadMessages(convId: string): Promise<Array<{
+  id: string;
   role: string;
   content: string;
+  timestamp: number;
 }>> {
   await dbExecute(
     "CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, conversation_id TEXT, role TEXT, content TEXT, timestamp INTEGER)",
@@ -130,13 +132,15 @@ export async function loadMessages(convId: string): Promise<Array<{
   );
 
   const rows = await dbSelect(
-    "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY timestamp",
+    "SELECT id, role, content, timestamp FROM messages WHERE conversation_id = ? ORDER BY timestamp",
     [convId]
   );
 
   return rows as Array<{
+    id: string;
     role: string;
     content: string;
+    timestamp: number;
   }>;
 }
 

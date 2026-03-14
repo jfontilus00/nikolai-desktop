@@ -2,21 +2,19 @@
 import type { ChatThread, Message, ProviderConfig } from "./types";
 import { uid } from "./lib/id";
 import {
-  loadActiveChatId,
-  loadChats,
-  saveActiveChatId,
-  saveChats,
   loadLayout,
   loadProvider,
   saveProvider,
 } from "./lib/storage";
+import { useChats } from "./hooks/useChats";
 import ResizableShell from "./components/ResizableShell";
 import ChatHistory from "./components/ChatHistory";
 import ChatCenter from "./components/ChatCenter";
 import RightPanel from "./components/RightPanel";
 import ToolApprovalModal from "./components/ToolApprovalModal";
 import ErrorBoundary from "./components/ErrorBoundary";
-import { ollamaStreamChat } from "./lib/ollamaStream";
+import TestRecorder from "./components/TestRecorder";
+import { ollamaStreamChat, StreamTimeoutError } from "./lib/ollamaStream";
 import { streamChatWithProvider } from "./lib/providerStream";
 import { agenticStreamChat } from "./lib/agentic";
 import { parseToolCommand } from "./lib/toolCmd";
@@ -27,6 +25,8 @@ import { withTimeout } from "./lib/timeout";
 
 // Voice
 import { loadVoiceSettings } from "./lib/voiceSettings";
+import { logUsage } from "./lib/usageLog";
+import { estimateTokensFromText } from "./lib/tokenEstimator";
 import { ttsSpeak, ttsSpeakQueued } from "./lib/ttsClient";
 
 // ── Sentence boundary detection ────────────────────────────────────────────
@@ -106,34 +106,41 @@ function splitSentences(text: string): string[] {
   return results;
 }
 
-// ── Agentic trigger heuristic ─────────────────────────────────────────────────
-function shouldUseAgentic(text: string) {
-  const t = (text || "").trim().toLowerCase();
-  if (!t) return false;
-  if (t.startsWith("/")) return false;
+/**
+ * Returns true ONLY when the user message clearly requires
+ * filesystem access or explicit tool use.
+ *
+ * TRUE (agent mode):   "read config.ts", "list files in src/", "fix the parseJSON function"
+ * FALSE (chat mode):   "brainstorm ideas", "how does recursion work", "analyze my approach"
+ */
+function shouldUseAgentic(prompt: string): boolean {
+  const t = prompt.toLowerCase().trim();
 
-  if (t.startsWith("use tool") || t.startsWith("run tool") || t.startsWith("call tool")) return true;
+  // GATE 1 — Explicit filesystem operation on a named target
+  const explicitFileOp = /\b(read|open|load|write|save|create|delete|remove|rename|move|copy)\s+(the\s+)?(file|folder|directory|dir|path|document|config|script|module)\b/i;
+  if (explicitFileOp.test(t)) return true;
 
-  // Memory triggers — "remember X", "note that X", "save that X", "forget X"
-  if (/\b(remember|note that|save that|forget|add to memory|store this)\b/.test(t)) return true;
+  // GATE 2 — Explicit listing or searching for files
+  const explicitList = /\b(list|show|find|search|scan|grep)\s+(all\s+)?(files?|folders?|directories|\.ts|\.js|\.tsx|\.py|\.rs|\.json|\.md)\b/i;
+  if (explicitList.test(t)) return true;
 
-  // Action verbs — expanded to cover real-world usage ("scan", "audit", "check", etc.)
-  const actionVerbs = /\b(read|open|write|create|generate|export|analyse|analyze|refactor|fix|update|edit|search|list|scan|audit|review|check|inspect|summarize|summarise|show|find|look|get|count|rename|move|copy|delete|remove|add|insert|replace|build|run|execute|print|output|display)\b/;
+  // GATE 3 — Explicit open/read of codebase (NOT just "analyze" or "review")
+  const explicitCodeRead = /\b(open|read|inspect)\s+(the\s+)?(code|codebase|repo|repository|source)\b/i;
+  if (explicitCodeRead.test(t)) return true;
 
-  // File/project nouns — expanded
-  const fileNouns = /\b(file|files|folder|folders|directory|directories|project|codebase|repo|repository|docx|pdf|pptx|xlsx|report|diagram|mermaid|source|code|script|module|function|class|component|config|json|yaml|toml|csv|log|logs|readme|package|dependency|dependencies|workspace)\b/;
+  // GATE 4 — Message contains a literal file path or file extension
+  const hasFilePath = /[a-zA-Z0-9_\-\/\\]+\.(ts|js|tsx|jsx|rs|py|json|md|txt|toml|yaml|yml|css|html)\b/;
+  if (hasFilePath.test(t)) return true;
 
-  if (actionVerbs.test(t) && fileNouns.test(t)) return true;
+  // GATE 5 — User explicitly requests tool/agent/command use
+  const explicitToolRequest = /\b(use|call|run|execute)\s+(the\s+)?(tool|agent|command)\b/i;
+  if (explicitToolRequest.test(t)) return true;
 
-  // Shell-style commands
-  if (/\b(ls|grep|cat|find|mv|cp|rm|mkdir|touch|head|tail|wc)\b/.test(t)) return true;
+  // GATE 6 — Explicit write/edit on a named code artifact
+  const explicitCodeWrite = /\b(write|add|edit|modify|update|refactor|fix|implement)\s+(the\s+|a\s+)?(function|class|component|method|implementation|module)\b/i;
+  if (explicitCodeWrite.test(t)) return true;
 
-  // Standalone high-intent phrases that clearly need tools — no noun required
-  if (/\b(scan the|audit the|review the|analyse the|analyze the|inspect the|check the|summarize the|summarise the|list all|show all|find all|count all|search for|look for|look at|look in|look through|go through)\b/.test(t)) return true;
-
-  // "what (files|functions|classes|errors|issues|dependencies) ..." pattern
-  if (/\bwhat (files|functions|classes|components|errors|issues|imports|dependencies|modules|routes|endpoints|tests)\b/.test(t)) return true;
-
+  // Pure chat — brainstorming, questions, discussion → no tools
   return false;
 }
 
@@ -144,11 +151,10 @@ function newChat(): ChatThread {
 }
 
 export default function App() {
-  const [chats, setChats] = useState<ChatThread[]>(() => loadChats());
+  const { chats, setChats, activeId, setActiveId, createChat: createChatDb, saveMessage, deleteChat: deleteChatDb, loading } = useChats();
   const chatsRef = useRef<ChatThread[]>(chats);
   useEffect(() => { chatsRef.current = chats; }, [chats]);
 
-  const [activeId, setActiveId] = useState<string | null>(() => loadActiveChatId());
   const [leftCollapsed, setLeftCollapsed] = useState(() => loadLayout().leftCollapsed);
   const [rightCollapsed, setRightCollapsed] = useState(() => loadLayout().rightCollapsed);
 
@@ -198,7 +204,7 @@ export default function App() {
   const streamingBuffersRef = useRef<Map<string, StreamBuffer>>(new Map());
 
   const flushStreamingBuffer = useCallback(
-    (chatId: string, messageId: string, forcePersist: boolean = false) => {
+    async (chatId: string, messageId: string, forcePersist: boolean = false) => {
       const buffers = streamingBuffersRef.current;
       const buf = buffers.get(messageId);
       if (!buf || !buf.pending || buf.chatId !== chatId) return;
@@ -211,6 +217,7 @@ export default function App() {
       const now = Date.now();
       const shouldPersist = forcePersist || now - buf.lastPersist > 500;
 
+      // Update React state (synchronous)
       setChats((prev) => {
         const next = prev.map((c) => {
           if (c.id !== chatId) return c;
@@ -219,14 +226,21 @@ export default function App() {
           );
           return { ...c, updatedAt: Date.now(), messages: msgs };
         });
-        if (shouldPersist) {
-          buf.lastPersist = now;
-          saveChats(next);
-        }
         return next;
       });
+
+      // Persist to SQLite after state update (async)
+      if (shouldPersist) {
+        buf.lastPersist = now;
+        // Get the complete message content from state
+        const chat = chats.find(c => c.id === chatId);
+        const message = chat?.messages.find(m => m.id === messageId);
+        if (message?.content) {
+          await saveMessage(chatId, message.role, message.content).catch(console.error);
+        }
+      }
     },
-    []
+    [chats, saveMessage, setChats]
   );
 
   const scheduleFlush = useCallback(
@@ -256,6 +270,7 @@ export default function App() {
         const buf = buffers.get(messageId);
         if (!buf || buf.chatId !== chatId) return;
         buf.chunks.push(t);
+        assistantTextRef.current += t;
         // Sentence streaming detection
         sentenceBufferRef.current += t;
 
@@ -391,10 +406,19 @@ export default function App() {
           modified = true;
         }
       });
-      if (modified) saveChats(currentChats);
+      // Persist any remaining buffered content on unmount
+      if (modified) {
+        currentChats.forEach(async (chat) => {
+          for (const msg of chat.messages) {
+            if (msg.content) {
+              await saveMessage(chat.id, msg.role, msg.content).catch(console.error);
+            }
+          }
+        });
+      }
       buffers.clear();
     };
-  }, []);
+  }, [saveMessage]);
 
   const toolApprovalResolveRef = useRef<((choice: "deny" | "once" | "chat") => void) | null>(null);
   const [toolApproval, setToolApproval] = useState<{ open: boolean; toolName: string; toolArgs: any }>({
@@ -567,17 +591,20 @@ export default function App() {
     return await withTimeout(mcpCallTool(name, normalizedArgs, signal), getToolTimeout(name), `Tool timeout: ${name}`, signal);
   };
 
-  const activeChat = useMemo(() => chats.find((c) => c.id === activeId) || null, [chats, activeId]);
+  const activeChat = useMemo(() => {
+    const found = chats.find((c) => c.id === activeId);
+    console.log("[APP] activeChat", { activeId, chatsLength: chats.length, found: !!found, messages: found?.messages?.length });
+    return found || null;
+  }, [chats, activeId]);
 
   // Thinking indicator: show when streaming but no content yet
   const isThinking = isStreaming && activeChat && activeChat.messages.length > 0 && !activeChat.messages[activeChat.messages.length - 1]?.content;
 
   const persist = (next: ChatThread[], nextActive?: string | null) => {
     setChats(next);
-    saveChats(next);
     if (typeof nextActive !== "undefined") {
       setActiveId(nextActive);
-      saveActiveChatId(nextActive);
+      localStorage.setItem('nikolai.activeChatId.v1', nextActive);
     }
   };
 
@@ -586,25 +613,24 @@ export default function App() {
     saveProvider(p);
   };
 
-  const createChat = () => {
-    const c = newChat();
-    persist([c, ...chats], c.id);
+  const createChat = async () => {
+    await createChatDb();
   };
 
-  const deleteChat = (id: string) => {
+  const deleteChat = async (id: string) => {
     const c = chats.find((c) => c.id === id);
     if (!confirm(`Delete "${c?.title || "this chat"}"? This cannot be undone.`)) return;
-    const next = chats.filter((c) => c.id !== id);
-    persist(next, activeId === id ? (next[0]?.id ?? null) : activeId);
+    await deleteChatDb(id);
   };
 
-  const renameChat = (id: string, title: string) => {
-    persist(chats.map((c) => (c.id === id ? { ...c, title, updatedAt: Date.now() } : c)));
+  const renameChat = async (id: string, title: string) => {
+    setChats(chats.map((c) => (c.id === id ? { ...c, title, updatedAt: Date.now() } : c)));
+    // Note: SQLite doesn't have rename yet, title is stored in conversation
   };
 
   const selectChat = (id: string) => {
     setActiveId(id);
-    saveActiveChatId(id);
+    localStorage.setItem('nikolai.activeChatId.v1', id);
   };
 
   const stop = () => {
@@ -630,7 +656,6 @@ export default function App() {
         });
         return { ...c, updatedAt: Date.now(), messages: msgs };
       });
-      saveChats(next);
       return next;
     });
   };
@@ -646,6 +671,9 @@ export default function App() {
   const lastEarlyTriggerRef = useRef(0);
   const voiceSessionActiveRef = useRef<boolean>(false);
 
+  // Accumulates assistant text during streaming
+  const assistantTextRef = useRef<string>("");
+
   // Truncates to 40 chars — enough to distinguish chats in the sidebar.
   const autoTitleChat = useCallback((chatId: string, userText: string) => {
     setChats((prev) => {
@@ -653,9 +681,7 @@ export default function App() {
       if (!chat || chat.title !== "New chat") return prev;
       const raw   = userText.trim().replace(/\n/g, " ");
       const title = raw.length > 40 ? raw.slice(0, 40) + "…" : raw;
-      const next  = prev.map((c) => c.id === chatId ? { ...c, title, updatedAt: Date.now() } : c);
-      saveChats(next);
-      return next;
+      return prev.map((c) => c.id === chatId ? { ...c, title, updatedAt: Date.now() } : c);
     });
   }, []);
 
@@ -670,8 +696,8 @@ async function maybeAutoSpeakLastAssistant(chatId?: string) {
       if (!vs.autoSpeak || !voiceSessionActiveRef.current) {
         return;
       }
-      const all = loadChats();
-      const id = chatId || loadActiveChatId();
+      const all = chats;
+      const id = chatId || activeId;
       const thread = all.find((c) => c.id === id) || all[0];
       const msg = thread?.messages
         ?.slice().reverse()
@@ -774,7 +800,6 @@ useEffect(() => {
         if (c.id !== chat.id) return c;
         return { ...c, updatedAt: Date.now(), messages: c.messages.map((m, idx) => idx === asstIdx ? { ...m, content: "" } : m) };
       });
-      saveChats(next);
       return next;
     });
 
@@ -791,9 +816,12 @@ useEffect(() => {
 
       const onToken = createStreamingTokenHandler(chat.id, assistantMsgId);
       const onStatus = (s: string) => setAgentStatus(s);
-      const isOllama = ((provider as any)?.kind || "ollama") === "ollama";
+      const isOllama = provider?.kind === "ollama";
 
-      if (shouldUseAgentic(prompt) && getCachedTools().length > 0) {
+      const useAgent = shouldUseAgentic(prompt) && getCachedTools().length > 0;
+      console.log(`[ROUTING] ${useAgent ? "AGENT" : "CHAT"} — "${prompt.slice(0, 60)}"`);
+
+      if (useAgent) {
         const agenticChatFn = isOllama ? undefined : async (msgs: any[], signal: AbortSignal) => {
           let result = "";
           await streamChatWithProvider({ provider, messages: msgs, signal, onToken: (t: string) => { result += t; } });
@@ -813,6 +841,7 @@ useEffect(() => {
           plannerModel: ((provider as any)?.ollamaPlannerModel || provider.ollamaModel),
           chatFn: agenticChatFn,
           streamFn: agenticStreamFn,
+          prompt,  // Pass original prompt for tool filtering
         });
       } else {
         if (isOllama) {
@@ -821,6 +850,12 @@ useEffect(() => {
           await streamChatWithProvider({ provider, messages: baseHistory as any, signal: controller.signal, onToken });
         }
       }
+    } catch (err) {
+      if (err instanceof StreamTimeoutError) {
+        console.warn("[APP] stream timeout handled");
+        return;
+      }
+      console.warn("stream error:", err);
     } finally {
       abortRef.current = null;
       setIsStreaming(false);
@@ -836,25 +871,40 @@ useEffect(() => {
       const next = prev.map((c) =>
         c.id === chatId ? { ...c, systemPrompt: prompt || undefined, updatedAt: Date.now() } : c
       );
-      saveChats(next);
       return next;
     });
   }, []);
 
   const send = async (text: string, images?: string[]) => {
+    console.log("[CHAT] user message", text);
     if (sendingRef.current) return;   // block double-send
     let chat = activeChat;
-    if (!chat) { createChat(); return; }
+    if (!chat) { 
+      console.log("[CHAT] no active chat - calling createChat");
+      const newChatId = await createChat();
+      console.log("[CHAT] after createChat", { newChatId, chatsLength: chatsRef.current.length });
+      // Get the newly created chat from ref (which has latest state)
+      chat = chatsRef.current.find(c => c.id === newChatId) || null;
+      if (!chat) {
+        console.log("[CHAT] still no chat after createChat - returning");
+        return;
+      }
+    }
     if (isStreaming) return;
 
     const userMsg: Message = { id: uid("m"), role: "user", content: text, ts: Date.now(), ...(images && images.length > 0 ? { images } : {}) };
     const assistantMsgId = uid("m");
     const assistantMsg: Message = { id: assistantMsgId, role: "assistant", content: "", ts: Date.now() + 1 };
 
+    // Reset assistant text accumulator for this message
+    assistantTextRef.current = "";
+
     const updatedChats = chats.map((c) =>
       c.id === chat!.id ? { ...c, updatedAt: Date.now(), messages: [...c.messages, userMsg, assistantMsg] } : c
     );
+    console.log("[CHAT] updating chats", { chatId: chat!.id, messageCount: updatedChats.find(c => c.id === chat!.id)?.messages.length });
     persist(updatedChats);
+    console.log("[CHAT] after persist", { chats: chats.length, activeId });
 
     const trimmed = text.trim();
 
@@ -878,7 +928,8 @@ useEffect(() => {
           if (c.id !== chat!.id) return c;
           return { ...c, updatedAt: Date.now(), messages: c.messages.map((m) => m.id === assistantMsgId ? { ...m, content: msg } : m) };
         });
-        saveChats(next);
+        // Persist the assistant message to SQLite
+        saveMessage(chat!.id, 'assistant', msg).catch(console.error);
         return next;
       });
       void maybeAutoSpeakLastAssistant(chat!.id);
@@ -889,6 +940,7 @@ useEffect(() => {
     const toolCmd = parseToolCommand(text);
     if (toolCmd) {
       if (!toolCmd.ok) {
+        const errorMsg = `⚠️ **Tool command error:**\n\`\`\`\n${toolCmd.error}\n\`\`\``;
         setChats((prev) => {
           const next = prev.map((c) => {
             if (c.id !== chat!.id) return c;
@@ -896,12 +948,13 @@ useEffect(() => {
               ...c, updatedAt: Date.now(),
               messages: c.messages.map((m) =>
                 m.id === assistantMsgId
-                  ? { ...m, content: `⚠️ **Tool command error:**\n\`\`\`\n${toolCmd.error}\n\`\`\`` }
+                  ? { ...m, content: errorMsg }
                   : m
               ),
             };
           });
-          saveChats(next);
+          // Persist the assistant message to SQLite
+          saveMessage(chat!.id, 'assistant', errorMsg).catch(console.error);
           return next;
         });
         return;
@@ -923,10 +976,12 @@ useEffect(() => {
             if (c.id !== chat!.id) return c;
             return { ...c, updatedAt: Date.now(), messages: c.messages.map((m) => m.id === assistantMsgId ? { ...m, content: formatted.text } : m) };
           });
-          saveChats(next);
+          // Persist the assistant message to SQLite
+          saveMessage(chat!.id, 'assistant', formatted.text).catch(console.error);
           return next;
         });
       } catch (e: any) {
+        const errorText = `⚠️ **Tool error** (${toolCmd.name})\n\n${e?.message || String(e)}`;
         setChats((prev) => {
           const next = prev.map((c) => {
             if (c.id !== chat!.id) return c;
@@ -934,12 +989,13 @@ useEffect(() => {
               ...c, updatedAt: Date.now(),
               messages: c.messages.map((m) =>
                 m.id === assistantMsgId
-                  ? { ...m, content: `⚠️ **Tool error** (${toolCmd.name})\n\n${e?.message || String(e)}` }
+                  ? { ...m, content: errorText }
                   : m
               ),
             };
           });
-          saveChats(next);
+          // Persist the assistant message to SQLite
+          saveMessage(chat!.id, 'assistant', errorText).catch(console.error);
           return next;
         });
       } finally {
@@ -954,7 +1010,11 @@ useEffect(() => {
     const controller = new AbortController();
     abortRef.current = controller;
 
+    let msgStartTime = 0;
+    let tokenResult: { promptTokens: number; completionTokens: number } | undefined;
+
     try {
+      msgStartTime = Date.now();
       // Use updatedChats (already has the new user message) — avoids a disk read
       const currentChat = updatedChats.find((c) => c.id === chat!.id);
 
@@ -975,7 +1035,7 @@ useEffect(() => {
 
       const onToken = createStreamingTokenHandler(chat!.id, assistantMsgId);
       const onStatus = (s: string) => setAgentStatus(s);
-      const isOllama = ((provider as any)?.kind || "ollama") === "ollama";
+      const isOllama = provider?.kind === "ollama";
 
       // Guard: only attempt agentic if MCP tools are loaded.
       // getCachedTools() returns [] when MCP is disconnected — no point starting
@@ -1004,7 +1064,7 @@ useEffect(() => {
         });
       } else {
         if (isOllama) {
-          await ollamaStreamChat({ baseUrl: provider.ollamaBaseUrl, model: provider.ollamaModel, messages: historyWithSys, signal: controller.signal, onToken });
+          tokenResult = await ollamaStreamChat({ baseUrl: provider.ollamaBaseUrl, model: provider.ollamaModel, messages: historyWithSys, signal: controller.signal, onToken });
         } else {
           await streamChatWithProvider({ provider, messages: history as any, signal: controller.signal, onToken });
         }
@@ -1017,6 +1077,35 @@ useEffect(() => {
       finalizeStreaming(chat!.id, assistantMsgId);
       autoTitleChat(chat!.id, text);          // set title from first user message
       void maybeAutoSpeakLastAssistant(chat!.id);
+
+      const assistantText = assistantTextRef.current || "";
+      console.log("[CHAT] assistant complete", {
+        textLength: assistantText.length,
+        text: assistantText.slice(0, 100)
+      });
+
+      // Track usage for non-agentic chat messages
+      try {
+        // Use real tokens if available, otherwise fall back to estimation
+        const promptTokens = tokenResult?.promptTokens ?? estimateTokensFromText(text);
+        // If Ollama returned 0 tokens or tokenResult is missing, fall back to estimation
+        const completionTokens =
+          tokenResult && tokenResult.completionTokens > 0
+            ? tokenResult.completionTokens
+            : estimateTokensFromText(assistantText);
+
+        logUsage({
+          timestamp: Date.now(),
+          type: "chat",
+          model: provider.ollamaModel,
+          promptTokens,
+          completionTokens,
+          estimatedTokens: promptTokens + completionTokens,
+          durationMs: Date.now() - msgStartTime
+        });
+      } catch (err) {
+        console.warn("[usageLog] failed to record chat usage", err);
+      }
     }
   };
 
@@ -1038,6 +1127,7 @@ useEffect(() => {
               onCreate={createChat}
               onDelete={deleteChat}
               onRename={renameChat}
+              loading={loading}
             />
           }
           center={
@@ -1054,7 +1144,7 @@ useEffect(() => {
               onUpdateSystemPrompt={updateSystemPrompt}
             />
           }
-          right={<RightPanel collapsed={rightCollapsed} provider={provider} setProvider={setProvider} />}
+          right={<RightPanel collapsed={rightCollapsed} provider={provider} setProvider={setProvider} chats={chats} activeId={activeId} />}
           onToggleLeft={(c) => setLeftCollapsed(c)}
           onToggleRight={(c) => setRightCollapsed(c)}
         />
@@ -1067,6 +1157,8 @@ useEffect(() => {
           onAllowOnce={() => closeToolApproval("once")}
           onAllowChat={() => closeToolApproval("chat")}
         />
+
+        {import.meta.env.DEV && <TestRecorder />}
       </>
     </ErrorBoundary>
   );

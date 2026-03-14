@@ -1,6 +1,6 @@
 ﻿import { invoke } from "@tauri-apps/api/tauri";
 import { ollamaChat, type OllamaMsg } from "./ollamaChat";
-import { ollamaStreamChat } from "./ollamaStream";
+import { ollamaStreamChat, StreamTimeoutError } from "./ollamaStream";
 import { getCachedTools as getToolCatalog, getCachedTools, type McpTool } from "./tool_cache";
 import { appendToolLog } from "./toolLog";
 import { formatToolResult } from "./toolResult";
@@ -9,6 +9,110 @@ import { loadIndex, searchIndex, formatSearchResults, type SemanticIndex } from 
 import { startAgentMetrics, incrementStep, recordToolUsage, finishAgentMetrics, recordLowConfidenceTool, recordReasoningLength, recordToolBudgetRemaining } from "./agent_metrics";
 import { createLoopGuard, recordTool, detectLoop, type LoopGuardState } from "./agent_loop_guard";
 import { reflectOnToolResult } from "./toolReflection";
+
+// ── Tool Filtering for Planner ────────────────────────────────────────────────
+/**
+ * Filters the full tool catalog to only tools relevant to the
+ * current prompt. Reduces token usage and prevents the planner
+ * from reaching for tools it doesn't need.
+ *
+ * Always falls back to full catalog if no category matches —
+ * this prevents over-filtering on edge cases.
+ */
+function filterToolsForPrompt(tools: McpTool[], prompt: string): McpTool[] {
+  const t = prompt.toLowerCase();
+
+  // Detect namespace from first tool in catalog (e.g., "dev" from "dev.write_file")
+  const firstTool = tools[0]?.name;
+  const namespace = firstTool?.includes(".") ? firstTool.split(".")[0] : "fs";
+
+  // Classify the request into categories
+  const wantsRead   = /\b(read|open|load|show|display|view|list|what.?s in|what is in)\b/.test(t);
+  const wantsWrite  = /\b(write|create|add|append|make|generate|build|scaffold|new file)\b/.test(t);
+  const wantsModify = /\b(edit|modify|update|change|refactor|fix|rename|move|delete|remove)\b/.test(t);
+  const wantsSearch = /\b(search|find|grep|look for|where is|which files|scan|contains)\b/.test(t);
+  const wantsWeb    = /\b(search the web|look up online|fetch|browse|website|url|http)\b/.test(t);
+
+  const allowed = new Set<string>();
+
+  // Read and list operations
+  if (wantsRead || wantsSearch) {
+    allowed.add(`${namespace}.read_file`);
+    allowed.add(`${namespace}.list_directory`);
+    allowed.add(`${namespace}.search_files`);
+    allowed.add(`${namespace}.grep_files`);
+    allowed.add(`${namespace}.get_file_info`);
+  }
+
+  // Write operations — also need read to check before writing
+  if (wantsWrite) {
+    allowed.add(`${namespace}.write_file`);
+    allowed.add(`${namespace}.create_directory`);
+    allowed.add(`${namespace}.append_file`);
+    allowed.add(`${namespace}.read_file`);      // check before writing
+    allowed.add(`${namespace}.list_directory`); // find target location
+  }
+
+  // Modify operations — read first, then targeted destructive tools
+  if (wantsModify) {
+    allowed.add(`${namespace}.edit_file`);
+    allowed.add(`${namespace}.read_file`);
+    allowed.add(`${namespace}.list_directory`);
+    // Destructive tools ONLY if explicitly named in the request
+    if (/\b(delete|remove|destroy)\b/.test(t)) allowed.add(`${namespace}.delete_file`);
+    if (/\b(move)\b/.test(t))                   allowed.add(`${namespace}.move_file`);
+    if (/\b(rename)\b/.test(t))                 allowed.add(`${namespace}.rename_file`);
+    if (/\b(copy|duplicate)\b/.test(t))         allowed.add(`${namespace}.copy_file`);
+  }
+
+  // Web tools
+  if (wantsWeb) {
+    allowed.add("web.search");
+    allowed.add("web.fetch");
+  }
+
+  // Always include workspace/batch tools when any file op is happening
+  if (wantsRead || wantsWrite || wantsModify || wantsSearch) {
+    tools.forEach(tool => {
+      if (tool.name.startsWith("ws_") || tool.name === "batch_commit") {
+        allowed.add(tool.name);
+      }
+    });
+  }
+
+  // Safety fallback — if nothing matched, return full catalog
+  // This prevents over-filtering on unusual or ambiguous requests
+  if (allowed.size === 0) {
+    console.log("[TOOLS] no category matched — using full catalog");
+    return tools;
+  }
+
+  // Convert allowed tool names into suffixes
+  // Example: "fs.write_file" -> ".write_file"
+  const allowedSuffixes = [...allowed].map(name => {
+    const idx = name.indexOf(".");
+    return idx !== -1 ? name.slice(idx) : name;
+  });
+
+  // Match tools by suffix instead of exact name
+  let filtered = tools.filter(tool =>
+    allowedSuffixes.some(suffix => tool.name.endsWith(suffix))
+  );
+
+  // SAFETY FALLBACK — never return zero tools
+  if (filtered.length === 0) {
+    console.warn(
+      `[TOOLS] filter returned 0 tools — falling back to full catalog`
+    );
+    filtered = tools;
+  }
+
+  console.log(
+    `[TOOLS] filtered ${tools.length} → ${filtered.length} tools for: "${prompt.slice(0,50)}"`
+  );
+
+  return filtered;
+}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -165,8 +269,36 @@ export const ALLOWED_TOOLS: string[] = [
   "hub.status",
 ];
 
-function isAgentTool(name: string): boolean {
-  return ALLOWED_TOOLS.some((allowed) => allowed === name);
+/**
+ * Checks if a tool is permitted for agent execution.
+ * Uses dynamic namespace detection: if MCP tools use a consistent
+ * namespace (e.g., "dev.*", "fs.*", "workspace.*"), all tools in
+ * that namespace are allowed. Synthetic tools (semantic.find, memory.*)
+ * are always allowed if explicitly listed in ALLOWED_TOOLS.
+ */
+function isAgentTool(name: string, tools?: McpTool[]): boolean {
+  // Always allow explicitly listed synthetic tools
+  if (ALLOWED_TOOLS.some((allowed) => allowed === name)) {
+    return true;
+  }
+
+  // Dynamic namespace detection for MCP tools
+  if (tools && tools.length > 0) {
+    // Extract namespace from first MCP tool (e.g., "dev" from "dev.write_file")
+    const firstToolName = tools[0].name;
+    const dotIndex = firstToolName.indexOf(".");
+    
+    if (dotIndex > 0) {
+      const namespace = firstToolName.slice(0, dotIndex);
+      // Allow all tools with the same namespace
+      if (name.startsWith(namespace + ".")) {
+        return true;
+      }
+    }
+  }
+
+  // Not in ALLOWED_TOOLS and doesn't match MCP namespace
+  return false;
 }
 
 // ── Tool name aliasing ────────────────────────────────────────────────────────
@@ -817,7 +949,7 @@ function toolCatalog(tools: McpTool[], hasSemanticIndex: boolean, hasWorkspaceRo
     lines.push(`- ${MEMORY_TOOL_DESCRIPTION}`);
   }
 
-  const allowed = (tools || []).filter((t) => isAgentTool(t.name));
+  const allowed = (tools || []).filter((t) => isAgentTool(t.name, tools));
   for (const t of allowed) {
     lines.push(`- ${t.name}${t.description ? ` — ${t.description}` : ""}`);
   }
@@ -897,11 +1029,25 @@ function buildPlannerSystem(
       `TWO valid output shapes:\n` +
       `1. Call a tool:   {"action":"tool","name":"<exact_tool_name>","args":{...}}\n` +
       `2. Done:          {"action":"final","content":"...your final answer..."}\n\n` +
+      `Before using any tool, ask: "Does this task REQUIRE filesystem access, or can I answer directly from my knowledge?"\n\n` +
+      `Answer directly (no tools) when user is:\n` +
+      `- Asking a question or seeking an explanation\n` +
+      `- Brainstorming, planning, or discussing ideas\n` +
+      `- Reviewing their own thinking or approach\n\n` +
+      `Use tools only when user is:\n` +
+      `- Explicitly asking to read, write, list, or search files\n` +
+      `- Referencing a specific file path or filename\n` +
+      `- Asking to modify or create code in the codebase\n\n` +
+      `Default: respond directly. Use tools only when clearly required.\n\n` +
       `Rules:\n` +
       `- Output JSON only. Any prose = invalid.\n` +
       `- Use "final" when you have enough to answer or all writes are planned.\n` +
-      `- NEVER invent file contents — use fs.read_file first.\n` +
-      `- NEVER guess directory listings — use fs.list_directory first.\n` +
+      `- Only use filesystem tools when the task EXPLICITLY requires file access.\n` +
+      `- If the user is brainstorming, asking questions, or discussing ideas, respond directly without tools.\n` +
+      `- Use fs.read_file only when you need to read a specific named file.\n` +
+      `- Use fs.list_directory only when the user explicitly asks to see directory contents.\n` +
+      `- When uncertain whether a tool is needed, prefer responding directly without tools.\n` +
+      `- Do NOT explore the filesystem proactively — only access files when clearly required.\n` +
       `- Avoid node_modules, .git, dist, build directories.\n\n` +
       `Example:  {"action":"tool","name":"fs.read_file","args":{"path":"src/App.tsx"}}\n` +
       `Example:  {"action":"final","content":"Done."}\n\n` +
@@ -1006,6 +1152,8 @@ export async function agenticStreamChat(opts: {
   streamFn?: (messages: OllamaMsg[], signal: AbortSignal, onToken: (t: string) => void) => Promise<void>;
   // Optional: unique run ID for persistence (auto-generated if not provided)
   runId?: string;
+  // Original user prompt for tool filtering
+  prompt?: string;
 }): Promise<void> {
   // Clear trace from previous run
   executionTrace.length = 0;
@@ -1039,7 +1187,7 @@ export async function agenticStreamChat(opts: {
   });
 
   // ── Start metrics tracking ─────────────────────────────────────────────────
-  startAgentMetrics(runId);
+  startAgentMetrics(runId, opts.model);
 
   // ── Compute adaptive tool budget ──────────────────────────────────────────
   // Budget based on user input complexity.
@@ -1438,8 +1586,13 @@ export async function agenticStreamChat(opts: {
     // ── Record step for metrics ─────────────────────────────────────────────
     incrementStep();
 
+    // Filter to only relevant tools for this prompt
+    // Reduces token usage and prevents tool hallucination
+    const userPrompt = opts.prompt ?? opts.messages?.[opts.messages.length - 1]?.content ?? "";
+    const filteredTools = filterToolsForPrompt(toolCatalogCache.tools, userPrompt);
+    
     const plannerSystem = buildPlannerSystem(
-      toolCatalog(toolCatalogCache.tools, hasSemanticIndex, batchMode),
+      toolCatalog(filteredTools, hasSemanticIndex, batchMode),
       step, maxSteps, batchMode, memoryText
     );
 
@@ -1488,6 +1641,15 @@ export async function agenticStreamChat(opts: {
         lastLlmError = null;
         break;
       } catch (e: any) {
+        // StreamTimeoutError = Ollama timed out producing a response.
+        // This is NOT a retryable LLM error — retrying will just
+        // timeout again. Exit the retry loop immediately.
+        if (e instanceof StreamTimeoutError) {
+          console.warn("[AGENT] stream timeout — exiting retry loop immediately");
+          lastLlmError = e;
+          break;
+        }
+
         lastLlmError = e;
         if (e?.name === "AbortError") throw e; // Don't retry abort errors
 
@@ -1510,6 +1672,18 @@ export async function agenticStreamChat(opts: {
     let plan = parsePlan(planText);
 
     if (!plan) {
+      // If the empty plan is because of a stream timeout,
+      // do NOT retry — we would just timeout again.
+      // Break immediately and let the agent produce a fallback answer.
+      if (planText === "" && lastLlmError instanceof StreamTimeoutError) {
+        console.warn("[AGENT] parse failure caused by stream timeout — skipping parse retries");
+        convo.push({
+          role: "assistant",
+          content: "[planner] Stream timed out. Proceeding to answer directly.",
+        });
+        break;
+      }
+
       consecutiveParseFailures++;
       if (consecutiveParseFailures > MAX_PLAN_PARSE_RETRIES) {
         convo.push({
@@ -1565,12 +1739,12 @@ export async function agenticStreamChat(opts: {
       continue;
     }
 
-    if (!isAgentTool(toolName)) {
+    if (!isAgentTool(toolName, tools)) {
       convo.push({
         role: "assistant",
         content: `[tool blocked] "${toolName}" is not in the allowed tools list. ` +
           `Only explicitly permitted tools can be executed. ` +
-          `Available tools: ${ALLOWED_TOOLS.slice(0, 8).join(", ")}${ALLOWED_TOOLS.length > 8 ? "..." : ""}`,
+          `Available tools: ${tools.length} MCP tools loaded`,
       });
       continue;
     }

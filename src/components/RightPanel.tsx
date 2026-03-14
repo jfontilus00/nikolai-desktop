@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import type { ProviderConfig, ProviderKind } from "../types";
+import type { ChatThread, ProviderConfig, ProviderKind } from "../types";
 import { uid } from "../lib/id";
 import ToolsPanel from "./ToolsPanel";
 import VoicePanel from "./VoicePanel";
@@ -26,6 +26,8 @@ type Props = {
   provider: ProviderConfig;
   setProvider: (p: ProviderConfig) => void;
   onInsertToComposer?: (text: string) => void;
+  chats: ChatThread[];
+  activeId: string | null;
 };
 
 function kindLabel(kind: ProviderKind) {
@@ -220,6 +222,8 @@ export default function RightPanel({
   provider,
   setProvider,
   onInsertToComposer,
+  chats,
+  activeId,
 }: Props) {
   const [tab, setTab] = useState<"providers" | "tools" | "voice" | "memory" | "about">(
     "providers"
@@ -424,7 +428,7 @@ export default function RightPanel({
         {tab === "tools" && <ToolsPanel onInsertToComposer={onInsertToComposer} />}
 
         {/* ── Voice tab ── */}
-        {tab === "voice" && <VoicePanel onInsertToComposer={onInsertToComposer} />}
+        {tab === "voice" && <VoicePanel onInsertToComposer={onInsertToComposer} chats={chats} activeId={activeId} />}
 
         {/* ── About tab ── */}
         {tab === "about" && <AboutPanel />}

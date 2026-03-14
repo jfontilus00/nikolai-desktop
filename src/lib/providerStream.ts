@@ -19,7 +19,21 @@ export async function streamChatWithProvider(opts: {
 }): Promise<void> {
   const p: any = opts.provider;
 
-  if ((p.kind || "ollama") === "ollama") {
+  console.log("[ROUTER] sending to provider", {
+    kind: p.kind,
+    model: p.ollamaModel,
+    endpoint: p.ollamaBaseUrl
+  });
+
+  if (!p.kind) {
+    throw new Error("Provider kind is not set. Please configure your provider in Settings.");
+  }
+
+  if (p.kind === "ollama") {
+    console.log("[PROVIDER] request start (Ollama)", {
+      url: p.ollamaBaseUrl,
+      model: p.ollamaModel
+    });
     return await ollamaStreamChat({
       baseUrl: p.ollamaBaseUrl,
       model: p.ollamaModel,
@@ -33,6 +47,10 @@ export async function streamChatWithProvider(opts: {
     const apiKey = String(p.apiKey || "").trim();
     if (!apiKey) throw new Error("API key is missing (Providers tab).");
 
+    console.log("[PROVIDER] request start (OpenAI-compat)", {
+      url: p.ollamaBaseUrl,
+      model: p.ollamaModel
+    });
     return await openaiCompatStreamChat({
       baseUrl: p.ollamaBaseUrl,
       apiKey,
@@ -46,6 +64,10 @@ export async function streamChatWithProvider(opts: {
   if (p.kind === "anthropic") {
     const apiKey = String(p.apiKey || "").trim();
     if (!apiKey) throw new Error("Anthropic API key is missing (Providers tab).");
+
+    console.log("[PROVIDER] request start (Anthropic)", {
+      model: p.ollamaModel
+    });
 
     const system = opts.messages
       .filter(m => m.role === "system")

@@ -199,10 +199,10 @@ pub fn save_message(
     Ok(())
 }
 
-pub fn load_messages(conn: &Connection, conv_id: &str) -> Result<Vec<(String, String)>, String> {
+pub fn load_messages(conn: &Connection, conv_id: &str) -> Result<Vec<(String, String, String, i64)>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT role, content FROM messages
+            "SELECT id, role, content, timestamp FROM messages
              WHERE conversation_id = ?
              ORDER BY timestamp",
         )
@@ -210,7 +210,12 @@ pub fn load_messages(conn: &Connection, conv_id: &str) -> Result<Vec<(String, St
 
     let messages = stmt
         .query_map(params![conv_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
         })
         .map_err(|e| format!("Failed to query messages: {}", e))?;
 
